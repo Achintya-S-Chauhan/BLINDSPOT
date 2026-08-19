@@ -2,7 +2,7 @@ from mss import mss
 from PIL import Image
 import time
 
-def capture_screen(save=True):
+def capture_screen(save=False):
     with mss() as sct:
         monitor = sct.monitors[1]
 

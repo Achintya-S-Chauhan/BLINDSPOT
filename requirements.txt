@@ -1,3 +1,5 @@
 mss
 pywin32
 pillow
+pytesseract
+opencv-python
