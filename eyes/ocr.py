@@ -111,8 +111,6 @@ def read_text_from_image(image_input, cleanup=True):
         else:
             return ""
 
-        gray = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)[1]
-
         raw_text = pytesseract.image_to_string(gray, lang="eng")
         return clean_text(raw_text)
 
