@@ -8,6 +8,7 @@ from context import RawObservation, InterpretedContext, DesktopContext
 from history import ContextHistory
 from understanding import ContextualUnderstandingAnalyzer
 from assistant import CompanionAssistant
+from ai import CompanionAI
 
 STABILITY_TIME = 1.5        # Time window must remain active before first OCR
 OCR_INTERVAL = 3.0          # Interval between periodic OCR scans in the same active window
@@ -198,6 +199,7 @@ def main():
     state_lock = threading.Lock()
     analyzer = ContextualUnderstandingAnalyzer()
     assistant = CompanionAssistant()
+    companion_ai = CompanionAI()
 
     # start monitor in background
     threading.Thread(target=monitor, args=(state, state_lock), daemon=True).start()
@@ -205,7 +207,11 @@ def main():
     # command loop (MAIN THREAD — typing works)
     try:
         while True:
-            cmd = input().strip().lower()
+            raw_input_line = input().strip()
+            if not raw_input_line:
+                continue
+
+            cmd = raw_input_line.lower()
             now = time.time()
 
             if cmd == "status":
@@ -234,6 +240,34 @@ def main():
                     print(f"Context:        {response.supporting_context['current_activity']} | {response.supporting_context.get('current_window') or ''}")
                 if response.supporting_context.get("flow"):
                     print(f"Flow:           {' -> '.join(response.supporting_context['flow'])}")
+
+            elif cmd.startswith("ask"):
+                question = raw_input_line[3:].strip()
+                if not question:
+                    print("\n[AI COMPANION]")
+                    print("Please specify a question. Example: ask What was I working on recently?")
+                else:
+                    with state_lock:
+                        cur_ctx = state["current_context"]
+                        start_time = state["context_start_time"]
+                        hist = state["history"]
+                        understanding = analyzer.analyze(
+                            current_context=cur_ctx,
+                            context_start_time=start_time,
+                            history=hist,
+                            now=now,
+                        )
+
+                    print("\n[BLINDSPOT thinking...]")
+                    answer = companion_ai.ask(
+                        current_context=cur_ctx,
+                        context_start_time=start_time,
+                        history=hist,
+                        understanding=understanding,
+                        user_query=question,
+                        now=now,
+                    )
+                    print(f"\n[BLINDSPOT]: {answer}")
 
             elif cmd in ("context", "understanding"):
                 with state_lock:
