@@ -3,6 +3,7 @@ import time
 from context import RawObservation, InterpretedContext, DesktopContext
 from history import ContextHistory
 from understanding import ContextualUnderstandingAnalyzer
+from assistant import CompanionAssistant
 from main import get_summary_times, close_active_context, format_time, format_timestamp
 
 
@@ -11,6 +12,7 @@ class TestMainIntegration(unittest.TestCase):
     def setUp(self):
         self.history = ContextHistory(maxlen=10)
         self.analyzer = ContextualUnderstandingAnalyzer()
+        self.assistant = CompanionAssistant()
         self.state = {
             "last_window": None,
             "last_context": None,
@@ -80,6 +82,26 @@ class TestMainIntegration(unittest.TestCase):
         self.assertEqual(understanding.current_activity, "coding")
         self.assertEqual(understanding.pattern_type, "focused_session")
         self.assertEqual(understanding.current_duration, 60.0)
+
+    def test_main_assistant_integration(self):
+        t0 = 1000.0
+        obs = RawObservation(window_title="VSCode", ocr_text="code")
+        interp = InterpretedContext(activity="coding", confidence=3)
+        ctx = DesktopContext(observation=obs, interpretation=interp)
+
+        self.state["current_context"] = ctx
+        self.state["context_start_time"] = t0
+
+        understanding = self.analyzer.analyze(
+            current_context=self.state["current_context"],
+            context_start_time=self.state["context_start_time"],
+            history=self.state["history"],
+            now=t0 + 60.0,
+        )
+        response = self.assistant.respond(understanding)
+
+        self.assertEqual(response.category, "focus")
+        self.assertIn("focused on the same coding activity", response.message)
 
     def test_formatting_helpers(self):
         self.assertEqual(format_time(45), "45s")
