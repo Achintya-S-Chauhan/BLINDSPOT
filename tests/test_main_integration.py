@@ -2,6 +2,7 @@ import unittest
 import time
 from context import RawObservation, InterpretedContext, DesktopContext
 from history import ContextHistory
+from understanding import ContextualUnderstandingAnalyzer
 from main import get_summary_times, close_active_context, format_time, format_timestamp
 
 
@@ -9,6 +10,7 @@ class TestMainIntegration(unittest.TestCase):
 
     def setUp(self):
         self.history = ContextHistory(maxlen=10)
+        self.analyzer = ContextualUnderstandingAnalyzer()
         self.state = {
             "last_window": None,
             "last_context": None,
@@ -58,6 +60,26 @@ class TestMainIntegration(unittest.TestCase):
         self.assertEqual(record.duration, 50.0)
         self.assertEqual(record.start_time, t0)
         self.assertEqual(record.end_time, t1)
+
+    def test_main_context_analyzer_integration(self):
+        t0 = 1000.0
+        obs = RawObservation(window_title="VSCode", ocr_text="code")
+        interp = InterpretedContext(activity="coding", confidence=3)
+        ctx = DesktopContext(observation=obs, interpretation=interp)
+
+        self.state["current_context"] = ctx
+        self.state["context_start_time"] = t0
+
+        understanding = self.analyzer.analyze(
+            current_context=self.state["current_context"],
+            context_start_time=self.state["context_start_time"],
+            history=self.state["history"],
+            now=t0 + 60.0,
+        )
+
+        self.assertEqual(understanding.current_activity, "coding")
+        self.assertEqual(understanding.pattern_type, "focused_session")
+        self.assertEqual(understanding.current_duration, 60.0)
 
     def test_formatting_helpers(self):
         self.assertEqual(format_time(45), "45s")

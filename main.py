@@ -6,6 +6,7 @@ from eyes.ocr import read_text_from_image
 from eyes.interpreter import interpret_context
 from context import RawObservation, InterpretedContext, DesktopContext
 from history import ContextHistory
+from understanding import ContextualUnderstandingAnalyzer
 
 STABILITY_TIME = 1.5        # Time window must remain active before first OCR
 OCR_INTERVAL = 3.0          # Interval between periodic OCR scans in the same active window
@@ -194,6 +195,7 @@ def main():
         "history": ContextHistory(maxlen=50),
     }
     state_lock = threading.Lock()
+    analyzer = ContextualUnderstandingAnalyzer()
 
     # start monitor in background
     threading.Thread(target=monitor, args=(state, state_lock), daemon=True).start()
@@ -212,6 +214,26 @@ def main():
                         print(f"current: {state['last_context']} ({format_time(current)})")
                     else:
                         print("no active context")
+
+            elif cmd in ("context", "understanding"):
+                with state_lock:
+                    understanding = analyzer.analyze(
+                        current_context=state["current_context"],
+                        context_start_time=state["context_start_time"],
+                        history=state["history"],
+                        now=now,
+                    )
+
+                print("\n[CONTEXTUAL UNDERSTANDING]")
+                if understanding.current_activity:
+                    dur_str = format_time(understanding.current_duration)
+                    print(f"Current:        {understanding.current_activity} ({dur_str}) | {understanding.current_window or ''}")
+                    flow_str = " -> ".join(understanding.recent_activities) if understanding.recent_activities else (understanding.current_activity or "")
+                    print(f"Recent Flow:    {flow_str}")
+                    print(f"Pattern:        {understanding.pattern_type} (confidence: {understanding.confidence}/3)")
+                    print(f"Interpretation: {understanding.interpretation}")
+                else:
+                    print("no active context detected")
 
             elif cmd == "history":
                 with state_lock:
