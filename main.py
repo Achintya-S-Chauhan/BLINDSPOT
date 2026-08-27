@@ -1,9 +1,11 @@
 import time
 import threading
-from eyes.window import get_active_window
+from eyes.window import get_active_window, get_active_window_rect
 from eyes.screen import capture_screen
 from eyes.ocr import read_text_from_image
 from eyes.interpreter import interpret_context
+from context import RawObservation, InterpretedContext, DesktopContext
+from history import ContextHistory
 
 STABILITY_TIME = 1.5        # Time window must remain active before first OCR
 OCR_INTERVAL = 3.0          # Interval between periodic OCR scans in the same active window
@@ -24,14 +26,35 @@ def format_time(seconds):
         return f"{seconds}s"
 
 
-def snapshot_current_context(state, now):
-    """Accumulate ongoing context duration into activity_time and advance context_start_time."""
+def format_timestamp(timestamp):
+    """Format Unix timestamp into HH:MM:SS."""
+    return time.strftime("%H:%M:%S", time.localtime(timestamp))
+
+
+def close_active_context(state, now):
+    """Close the ongoing context, update cumulative activity time, and record into history."""
     if state["last_context"] and state["context_start_time"]:
         duration = now - state["context_start_time"]
         state["activity_time"][state["last_context"]] = (
             state["activity_time"].get(state["last_context"], 0) + duration
         )
+        ctx_obj = state.get("previous_context_obj") or state.get("current_context")
+        if ctx_obj and state.get("history") is not None:
+            state["history"].record_transition(
+                context=ctx_obj,
+                start_time=state["context_start_time"],
+                end_time=now,
+            )
         state["context_start_time"] = now
+
+
+def get_summary_times(state, now):
+    """Return cumulative activity times including the ongoing active context duration."""
+    times = dict(state["activity_time"])
+    if state["last_context"] and state["context_start_time"]:
+        active_dur = max(0.0, now - state["context_start_time"])
+        times[state["last_context"]] = times.get(state["last_context"], 0) + active_dur
+    return times
 
 
 # ---------------- MONITOR THREAD ----------------
@@ -60,22 +83,45 @@ def monitor(state, lock):
                 if is_first_ocr or is_periodic_due:
                     # Run capture and OCR in memory (outside lock to avoid blocking CLI)
                     try:
-                        screenshot = capture_screen(save=False)
+                        win_rect = get_active_window_rect()
+                        screenshot = capture_screen(region=win_rect, save=False)
                         text = read_text_from_image(screenshot)
                     except Exception as e:
                         print(f"[MONITOR WARNING] Capture or OCR error: {e}")
                         text = ""
+                        win_rect = None
 
-                    context, confidence = interpret_context(current_window, text)
+                    activity, confidence = interpret_context(current_window, text)
+
+                    # Build structured context representation
+                    observation = RawObservation(
+                        window_title=current_window,
+                        ocr_text=text,
+                        window_rect=win_rect,
+                        timestamp=now,
+                        metadata={"ocr_char_count": len(text)},
+                    )
+                    interpretation = InterpretedContext(
+                        activity=activity,
+                        confidence=confidence,
+                    )
+                    desktop_context = DesktopContext(
+                        observation=observation,
+                        interpretation=interpretation,
+                        timestamp=now,
+                    )
 
                     with lock:
                         state["last_ocr_time"] = now
+                        state["current_context"] = desktop_context
+                        context = activity
 
                         # FIRST time case
                         if state["last_context"] is None:
                             state["last_context"] = context
                             state["last_confidence"] = confidence
                             state["context_start_time"] = now
+                            state["previous_context_obj"] = desktop_context
 
                             print("\n[CONTEXT UPDATE]")
                             print(f"You are {context}.")
@@ -90,16 +136,24 @@ def monitor(state, lock):
                                     state["candidate_start_time"] is not None
                                     and now - state["candidate_start_time"] >= MIN_CONTEXT_DURATION
                                 ):
-                                    # close previous context
+                                    # Close previous context episode and record transition in history
                                     if state["last_context"] and state["context_start_time"]:
                                         duration = now - state["context_start_time"]
                                         state["activity_time"][state["last_context"]] = (
                                             state["activity_time"].get(state["last_context"], 0) + duration
                                         )
+                                        prev_ctx = state.get("previous_context_obj") or desktop_context
+                                        if state.get("history") is not None:
+                                            state["history"].record_transition(
+                                                context=prev_ctx,
+                                                start_time=state["context_start_time"],
+                                                end_time=now,
+                                            )
 
                                     state["context_start_time"] = now
                                     state["last_context"] = context
                                     state["last_confidence"] = confidence
+                                    state["previous_context_obj"] = desktop_context
 
                                     print("\n[CONTEXT UPDATE]")
                                     print(f"You are {context}.")
@@ -111,6 +165,7 @@ def monitor(state, lock):
                             state["last_confidence"] = confidence
                             state["candidate_context"] = None
                             state["candidate_start_time"] = None
+                            state["previous_context_obj"] = desktop_context
 
             time.sleep(POLL_INTERVAL)
 
@@ -134,6 +189,9 @@ def main():
         "activity_time": {},
         "candidate_context": None,
         "candidate_start_time": None,
+        "current_context": None,
+        "previous_context_obj": None,
+        "history": ContextHistory(maxlen=50),
     }
     state_lock = threading.Lock()
 
@@ -155,10 +213,31 @@ def main():
                     else:
                         print("no active context")
 
+            elif cmd == "history":
+                with state_lock:
+                    records = state["history"].get_recent(limit=10)
+                    active_ctx = state["last_context"]
+                    active_start = state["context_start_time"]
+                    active_title = state["current_context"].window_title if state["current_context"] else ""
+
+                print("\n[RECENT CONTEXT HISTORY]")
+                if not records and not (active_ctx and active_start):
+                    print("no history recorded yet")
+                else:
+                    for r in records:
+                        t_start = format_timestamp(r.start_time)
+                        t_end = format_timestamp(r.end_time) if r.end_time else "..."
+                        print(f"{t_start} - {t_end} ({format_time(r.duration):>4}) | {r.activity:<20} | {r.window_title}")
+
+                    if active_ctx and active_start:
+                        current_dur = now - active_start
+                        t_start = format_timestamp(active_start)
+                        print(f"{t_start} - active   ({format_time(current_dur):>4}) | {active_ctx:<20} | {active_title}")
+
             elif cmd == "summary":
                 with state_lock:
-                    snapshot_current_context(state, now)
-                    summary_items = list(state["activity_time"].items())
+                    summary_times = get_summary_times(state, now)
+                    summary_items = list(summary_times.items())
 
                 print("\n[SUMMARY]")
                 for activity, seconds in summary_items:
@@ -168,8 +247,9 @@ def main():
         # close current context on exit
         now = time.time()
         with state_lock:
-            snapshot_current_context(state, now)
-            final_items = list(state["activity_time"].items())
+            close_active_context(state, now)
+            summary_times = get_summary_times(state, now)
+            final_items = list(summary_times.items())
 
         print("\n[FINAL TIME SUMMARY]")
         for activity, seconds in final_items:
