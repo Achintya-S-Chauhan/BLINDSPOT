@@ -136,6 +136,50 @@ class TestMainIntegration(unittest.TestCase):
 
         self.assertEqual(answer, "Integration test answer")
 
+    def test_main_conversation_integration(self):
+        t0 = 1000.0
+        obs = RawObservation(window_title="VSCode", ocr_text="code")
+        interp = InterpretedContext(activity="coding", confidence=3)
+        ctx = DesktopContext(observation=obs, interpretation=interp)
+
+        self.state["current_context"] = ctx
+        self.state["context_start_time"] = t0
+
+        understanding = self.analyzer.analyze(
+            current_context=self.state["current_context"],
+            context_start_time=self.state["context_start_time"],
+            history=self.state["history"],
+            now=t0 + 60.0,
+        )
+
+        # First turn
+        ans1 = self.companion_ai.ask(
+            current_context=self.state["current_context"],
+            context_start_time=self.state["context_start_time"],
+            history=self.state["history"],
+            understanding=understanding,
+            user_query="what am I doing?",
+            now=t0 + 60.0,
+        )
+        self.assertEqual(ans1, "Integration test answer")
+        self.assertEqual(len(self.companion_ai.conversation), 2)
+
+        # Second turn (follow-up)
+        ans2 = self.companion_ai.ask(
+            current_context=self.state["current_context"],
+            context_start_time=self.state["context_start_time"],
+            history=self.state["history"],
+            understanding=understanding,
+            user_query="explain that",
+            now=t0 + 65.0,
+        )
+        self.assertEqual(ans2, "Integration test answer")
+        self.assertEqual(len(self.companion_ai.conversation), 4)
+
+        # Clear conversation
+        self.companion_ai.clear_conversation()
+        self.assertEqual(len(self.companion_ai.conversation), 0)
+
     def test_formatting_helpers(self):
         self.assertEqual(format_time(45), "45s")
         self.assertEqual(format_time(125), "2m")

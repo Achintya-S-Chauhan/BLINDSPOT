@@ -4,10 +4,11 @@ import time
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from context import DesktopContext
 from history import ContextHistory
 from understanding import WorkflowUnderstanding, format_duration
+from conversation import ConversationSession, ConversationTurn
 
 
 class MissingAPIKeyError(Exception):
@@ -37,6 +38,7 @@ class LLMContextPayload:
     confidence: int
     current_ocr_snippet: Optional[str]
     user_query: str
+    conversation_history: List[Dict[str, Any]] = field(default_factory=list)
     timestamp: float = field(default_factory=time.time)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -58,6 +60,7 @@ class LLMContextPayload:
                 "interpretation": self.workflow_interpretation,
                 "confidence": self.confidence,
             },
+            "conversation_history": self.conversation_history,
             "user_query": self.user_query,
             "timestamp": self.timestamp,
         }
@@ -90,6 +93,12 @@ class LLMContextPayload:
         lines.append(f"Interpretation: {self.workflow_interpretation}")
         lines.append(f"Confidence:     {self.confidence}/3")
 
+        if self.conversation_history:
+            lines.append("\n=== RECENT CONVERSATION ===")
+            for turn in self.conversation_history:
+                speaker = "User" if turn.get("role") == "user" else "BLINDSPOT"
+                lines.append(f"{speaker}: {turn.get('content', '')}")
+
         lines.append(f"\n=== USER QUESTION ===\n{self.user_query}")
         return "\n".join(lines)
 
@@ -100,8 +109,10 @@ def format_context_payload(
     history: ContextHistory,
     understanding: WorkflowUnderstanding,
     user_query: str,
+    conversation: Optional[Union[ConversationSession, List[Dict[str, Any]]]] = None,
     max_ocr_chars: int = 250,
     max_recent_episodes: int = 5,
+    max_conversation_turns: int = 10,
     now: Optional[float] = None,
 ) -> LLMContextPayload:
     """
@@ -131,6 +142,13 @@ def format_context_payload(
             "duration_formatted": format_duration(r.duration),
         })
 
+    # Extract recent conversation turns (bounded)
+    conversation_turns: List[Dict[str, Any]] = []
+    if isinstance(conversation, ConversationSession):
+        conversation_turns = conversation.get_history_dicts(limit=max_conversation_turns)
+    elif isinstance(conversation, list):
+        conversation_turns = conversation[-max_conversation_turns:]
+
     return LLMContextPayload(
         current_activity=cur_act,
         current_window=cur_win,
@@ -143,6 +161,7 @@ def format_context_payload(
         confidence=understanding.confidence,
         current_ocr_snippet=ocr_snippet,
         user_query=user_query,
+        conversation_history=conversation_turns,
         timestamp=now,
     )
 
@@ -295,11 +314,22 @@ class CompanionAI:
         "detected activities, durations, recent transitions, OCR snippet).\n"
         "2. Clearly distinguish between what BLINDSPOT directly observed versus logical inferences.\n"
         "3. NEVER invent, hallucinate, or assume activities or applications that BLINDSPOT did not observe.\n"
-        "4. Be concise, direct, helpful, and speak in a friendly companion persona."
+        "4. Be concise, direct, helpful, and speak in a friendly companion persona.\n"
+        "5. When recent conversation is provided, maintain conversational continuity and understand "
+        "follow-up questions or references to earlier exchanges."
     )
 
-    def __init__(self, provider: Optional[LLMProvider] = None):
+    def __init__(
+        self,
+        provider: Optional[LLMProvider] = None,
+        conversation: Optional[ConversationSession] = None,
+    ):
         self.provider = provider or GeminiProvider()
+        self.conversation = conversation if conversation is not None else ConversationSession()
+
+    def clear_conversation(self) -> None:
+        """Reset the active conversation session."""
+        self.conversation.clear()
 
     def ask(
         self,
@@ -308,27 +338,36 @@ class CompanionAI:
         history: ContextHistory,
         understanding: WorkflowUnderstanding,
         user_query: str,
+        conversation: Optional[ConversationSession] = None,
         now: Optional[float] = None,
     ) -> str:
         """
-        Package structured live context and send query to the LLM provider.
+        Package structured live context, history, and conversation turns,
+        send query to the LLM provider, and record the dialogue turns.
         """
+        active_session = conversation if conversation is not None else self.conversation
+
         payload = format_context_payload(
             current_context=current_context,
             context_start_time=context_start_time,
             history=history,
             understanding=understanding,
             user_query=user_query,
+            conversation=active_session,
             now=now,
         )
 
         prompt_text = payload.to_prompt_text()
 
         try:
-            return self.provider.generate_response(
+            response = self.provider.generate_response(
                 system_instruction=self.SYSTEM_INSTRUCTION,
                 user_prompt=prompt_text,
             )
+            # Record user turn and assistant reply in conversation session
+            active_session.add_user_message(user_query)
+            active_session.add_assistant_message(response)
+            return response
         except MissingAPIKeyError as e:
             return str(e)
         except LLMProviderError as e:

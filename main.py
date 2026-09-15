@@ -9,6 +9,7 @@ from history import ContextHistory
 from understanding import ContextualUnderstandingAnalyzer
 from assistant import CompanionAssistant
 from ai import CompanionAI
+from conversation import ConversationSession
 
 STABILITY_TIME = 1.5        # Time window must remain active before first OCR
 OCR_INTERVAL = 3.0          # Interval between periodic OCR scans in the same active window
@@ -181,6 +182,8 @@ def monitor(state, lock):
 def main():
     print("BLINDSPOT — quiet vision + OCR online\n")
 
+    conversation = ConversationSession(maxlen=20)
+
     # shared state
     state = {
         "last_window": None,
@@ -195,11 +198,12 @@ def main():
         "current_context": None,
         "previous_context_obj": None,
         "history": ContextHistory(maxlen=50),
+        "conversation": conversation,
     }
     state_lock = threading.Lock()
     analyzer = ContextualUnderstandingAnalyzer()
     assistant = CompanionAssistant()
-    companion_ai = CompanionAI()
+    companion_ai = CompanionAI(conversation=conversation)
 
     # start monitor in background
     threading.Thread(target=monitor, args=(state, state_lock), daemon=True).start()
@@ -268,6 +272,21 @@ def main():
                         now=now,
                     )
                     print(f"\n[BLINDSPOT]: {answer}")
+
+            elif cmd in ("clear_chat", "clearchat", "clear-chat"):
+                companion_ai.clear_conversation()
+                print("\n[AI COMPANION]")
+                print("Conversation history cleared.")
+
+            elif cmd in ("chat", "conversation"):
+                turns = companion_ai.conversation.get_turns()
+                print("\n[CONVERSATION HISTORY]")
+                if not turns:
+                    print("no conversation history recorded yet")
+                else:
+                    for turn in turns:
+                        speaker = "User" if turn.role == "user" else "BLINDSPOT"
+                        print(f"{speaker}: {turn.content}")
 
             elif cmd in ("context", "understanding"):
                 with state_lock:

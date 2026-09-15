@@ -5,6 +5,7 @@ import json
 from context import RawObservation, InterpretedContext, DesktopContext
 from history import ContextHistory
 from understanding import ContextualUnderstandingAnalyzer
+from conversation import ConversationSession, ConversationTurn
 from ai import (
     LLMContextPayload,
     format_context_payload,
@@ -191,6 +192,127 @@ class TestAICompanionCore(unittest.TestCase):
         self.assertIn("=== OBSERVED DESKTOP CONTEXT ===", mock_provider.last_user_prompt)
         self.assertIn("Summarize what I did.", mock_provider.last_user_prompt)
         self.assertIn("BLINDSPOT", mock_provider.last_system_instruction)
+
+    def test_10_conversation_payload_inclusion(self):
+        """10. Test that conversation session turns appear in prompt text."""
+        ctx = self._create_context("coding", "VSCode")
+        history = ContextHistory(maxlen=10)
+        understanding = self.analyzer.analyze(ctx, 1000.0, history, now=1010.0)
+
+        session = ConversationSession(maxlen=10)
+        session.add_user_message("What am I working on?")
+        session.add_assistant_message("You are editing main.py in VS Code.")
+
+        payload = format_context_payload(
+            ctx, 1000.0, history, understanding, "explain that",
+            conversation=session, now=1010.0,
+        )
+        prompt = payload.to_prompt_text()
+
+        self.assertIn("=== RECENT CONVERSATION ===", prompt)
+        self.assertIn("User: What am I working on?", prompt)
+        self.assertIn("BLINDSPOT: You are editing main.py in VS Code.", prompt)
+        self.assertIn("=== USER QUESTION ===\nexplain that", prompt)
+
+    def test_11_companion_ai_session_accumulation(self):
+        """11. Test that CompanionAI records turns into its ConversationSession."""
+        mock_provider = MockLLMProvider(response_text="You're writing python tests.")
+        ai = CompanionAI(provider=mock_provider)
+
+        ctx = self._create_context("coding", "VSCode")
+        history = ContextHistory(maxlen=10)
+        understanding = self.analyzer.analyze(ctx, 1000.0, history, now=1010.0)
+
+        self.assertEqual(len(ai.conversation), 0)
+
+        reply = ai.ask(ctx, 1000.0, history, understanding, "what am I doing?")
+        self.assertEqual(reply, "You're writing python tests.")
+        self.assertEqual(len(ai.conversation), 2)
+
+        turns = ai.conversation.get_turns()
+        self.assertEqual(turns[0].role, "user")
+        self.assertEqual(turns[0].content, "what am I doing?")
+        self.assertEqual(turns[1].role, "assistant")
+        self.assertEqual(turns[1].content, "You're writing python tests.")
+
+    def test_12_followup_question_includes_prior_turns_in_llm_payload(self):
+        """12. Test that follow-up questions include previous conversation in provider prompt."""
+        mock_provider = MockLLMProvider(response_text="First answer")
+        ai = CompanionAI(provider=mock_provider)
+
+        ctx = self._create_context("coding", "VSCode")
+        history = ContextHistory(maxlen=10)
+        understanding = self.analyzer.analyze(ctx, 1000.0, history, now=1010.0)
+
+        # Turn 1
+        ai.ask(ctx, 1000.0, history, understanding, "what am I doing?")
+        self.assertNotIn("=== RECENT CONVERSATION ===", mock_provider.last_user_prompt)
+
+        # Turn 2: Follow-up
+        mock_provider.response_text = "Second answer"
+        ai.ask(ctx, 1000.0, history, understanding, "what was I doing before this?")
+        self.assertIn("=== RECENT CONVERSATION ===", mock_provider.last_user_prompt)
+        self.assertIn("User: what am I doing?", mock_provider.last_user_prompt)
+        self.assertIn("BLINDSPOT: First answer", mock_provider.last_user_prompt)
+        self.assertIn("=== USER QUESTION ===\nwhat was I doing before this?", mock_provider.last_user_prompt)
+
+    def test_13_bounded_conversation_in_payload(self):
+        """13. Test that format_context_payload limits conversation turns to max_conversation_turns."""
+        ctx = self._create_context("coding", "VSCode")
+        history = ContextHistory(maxlen=10)
+        understanding = self.analyzer.analyze(ctx, 1000.0, history, now=1010.0)
+
+        session = ConversationSession(maxlen=50)
+        for i in range(20):
+            session.add_user_message(f"Question {i}")
+            session.add_assistant_message(f"Answer {i}")
+
+        payload = format_context_payload(
+            ctx, 1000.0, history, understanding, "Latest question",
+            conversation=session, max_conversation_turns=4, now=1010.0,
+        )
+
+        # Should only have last 4 turns (2 user, 2 assistant)
+        self.assertEqual(len(payload.conversation_history), 4)
+        prompt = payload.to_prompt_text()
+        self.assertIn("Question 19", prompt)
+        self.assertIn("Answer 19", prompt)
+        self.assertNotIn("Question 0", prompt)
+
+    def test_14_clear_conversation(self):
+        """14. Test that clear_conversation resets the session and clears conversation in subsequent prompts."""
+        mock_provider = MockLLMProvider(response_text="Sure, here is the answer.")
+        ai = CompanionAI(provider=mock_provider)
+
+        ctx = self._create_context("coding", "VSCode")
+        history = ContextHistory(maxlen=10)
+        understanding = self.analyzer.analyze(ctx, 1000.0, history, now=1010.0)
+
+        ai.ask(ctx, 1000.0, history, understanding, "Initial question")
+        self.assertEqual(len(ai.conversation), 2)
+
+        ai.clear_conversation()
+        self.assertEqual(len(ai.conversation), 0)
+        self.assertTrue(ai.conversation.is_empty)
+
+        # Asking after clear should not have RECENT CONVERSATION section
+        ai.ask(ctx, 1000.0, history, understanding, "Fresh question")
+        self.assertNotIn("=== RECENT CONVERSATION ===", mock_provider.last_user_prompt)
+        self.assertIn("Fresh question", mock_provider.last_user_prompt)
+        self.assertEqual(len(ai.conversation), 2)
+
+    def test_15_provider_error_does_not_record_conversation_turn(self):
+        """15. Test that failed queries do not pollute conversation history."""
+        mock_provider = MockLLMProvider(should_raise=LLMProviderError("Timeout"))
+        ai = CompanionAI(provider=mock_provider)
+
+        ctx = self._create_context("coding", "VSCode")
+        history = ContextHistory(maxlen=10)
+        understanding = self.analyzer.analyze(ctx, 1000.0, history, now=1010.0)
+
+        response = ai.ask(ctx, 1000.0, history, understanding, "Failing question")
+        self.assertIn("[AI Provider Error]", response)
+        self.assertEqual(len(ai.conversation), 0)
 
 
 if __name__ == "__main__":
