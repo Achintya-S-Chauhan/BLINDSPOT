@@ -220,6 +220,7 @@ class BaseTool(ABC):
     def to_schema(self) -> Dict[str, Any]:
         """Return schema representation suitable for LLM function/tool calling."""
         return {
+            "type": "function",
             "name": self.name,
             "description": self.description,
             "parameters": self.parameters,
