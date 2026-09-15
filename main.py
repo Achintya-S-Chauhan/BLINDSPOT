@@ -10,7 +10,14 @@ from understanding import ContextualUnderstandingAnalyzer
 from assistant import CompanionAssistant
 from ai import CompanionAI
 from conversation import ConversationSession
-from tools import create_default_tool_registry
+from tools import (
+    create_default_tool_registry,
+    ActionRisk,
+    PermissionPolicy,
+    ActionRequest,
+    BLOCKED_DANGEROUS_TOOL_NAMES,
+)
+from desktop_io import MockDesktopIO
 
 STABILITY_TIME = 1.5        # Time window must remain active before first OCR
 OCR_INTERVAL = 3.0          # Interval between periodic OCR scans in the same active window
@@ -203,7 +210,35 @@ def main():
         "conversation": conversation,
     }
 
-    tool_registry = create_default_tool_registry(state=state, conversation=conversation, history=history)
+    # Use MockDesktopIO so action tools are registered and visible to Gemini,
+    # but no real hardware is touched without explicit CLI approval.
+    desktop_io = MockDesktopIO()
+
+    # CLI approval: prompt the user for LOW_RISK_ACTION approval at runtime
+    def _cli_approver(request: ActionRequest) -> bool:
+        try:
+            print(f"\n[BLINDSPOT ACTION REQUEST]")
+            print(f"  Tool:        {request.tool_name}")
+            print(f"  Risk level:  {request.risk.value}")
+            print(f"  Description: {request.description}")
+            if request.args:
+                print(f"  Arguments:   {request.args}")
+            answer = input("  Allow this action? [y/N]: ").strip().lower()
+            return answer in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            return False
+
+    permission_policy = PermissionPolicy(low_risk_approver=_cli_approver)
+
+    tool_registry = create_default_tool_registry(
+        state=state,
+        conversation=conversation,
+        history=history,
+        allow_actions=True,
+        permission_policy=permission_policy,
+        desktop_io=desktop_io,
+        include_action_tools=True,
+    )
     state["tool_registry"] = tool_registry
 
     state_lock = threading.Lock()
@@ -300,9 +335,26 @@ def main():
                 if not tools_list:
                     print("No tools registered.")
                 else:
-                    for t in tools_list:
-                        safety_str = "read-only" if t.is_read_only else "mutating action"
-                        print(f"- {t.name} ({safety_str}): {t.description}")
+                    ro_tools = [t for t in tools_list if t.risk == ActionRisk.READ_ONLY]
+                    action_tools = [t for t in tools_list if t.risk != ActionRisk.READ_ONLY]
+                    if ro_tools:
+                        print("  Read-Only (auto-approved):")
+                        for t in ro_tools:
+                            print(f"    - {t.name}: {t.description}")
+                    if action_tools:
+                        print("  Action Tools (require approval):")
+                        for t in action_tools:
+                            print(f"    - {t.name} [{t.risk.value}]: {t.description}")
+
+            elif cmd == "permissions":
+                print("\n[PERMISSION POLICY]")
+                print("  READ_ONLY       → auto-approved (no prompt needed)")
+                print("  LOW_RISK_ACTION → requires explicit CLI approval (y/N prompt)")
+                print("  HIGH_RISK_ACTION → unconditionally blocked")
+                print(f"\n  Always-blocked tool names ({len(BLOCKED_DANGEROUS_TOOL_NAMES)}):")
+                for bname in sorted(BLOCKED_DANGEROUS_TOOL_NAMES):
+                    print(f"    - {bname}")
+
 
             elif cmd in ("context", "understanding"):
                 with state_lock:
