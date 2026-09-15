@@ -6,6 +6,7 @@ from understanding import ContextualUnderstandingAnalyzer
 from assistant import CompanionAssistant
 from ai import CompanionAI, LLMProvider
 from main import get_summary_times, close_active_context, format_time, format_timestamp
+from tools import create_default_tool_registry
 
 
 class DummyProvider(LLMProvider):
@@ -19,7 +20,6 @@ class TestMainIntegration(unittest.TestCase):
         self.history = ContextHistory(maxlen=10)
         self.analyzer = ContextualUnderstandingAnalyzer()
         self.assistant = CompanionAssistant()
-        self.companion_ai = CompanionAI(provider=DummyProvider())
         self.state = {
             "last_window": None,
             "last_context": None,
@@ -34,6 +34,9 @@ class TestMainIntegration(unittest.TestCase):
             "previous_context_obj": None,
             "history": self.history,
         }
+        self.tool_registry = create_default_tool_registry(state=self.state, history=self.history)
+        self.state["tool_registry"] = self.tool_registry
+        self.companion_ai = CompanionAI(provider=DummyProvider(), tool_registry=self.tool_registry)
 
     def test_get_summary_times_ongoing(self):
         t0 = 1000.0
@@ -179,6 +182,26 @@ class TestMainIntegration(unittest.TestCase):
         # Clear conversation
         self.companion_ai.clear_conversation()
         self.assertEqual(len(self.companion_ai.conversation), 0)
+
+    def test_main_tools_integration(self):
+        """Verify tool registry integration and default read-only tools."""
+        self.assertIn("tool_registry", self.state)
+        registry = self.state["tool_registry"]
+        self.assertEqual(len(registry), 3)
+
+        tool_names = [t.name for t in registry.list_tools()]
+        self.assertIn("get_current_context", tool_names)
+        self.assertIn("get_recent_activity", tool_names)
+        self.assertIn("get_conversation_history", tool_names)
+
+        # All registered tools in Phase 6A must be read-only
+        for t in registry.list_tools():
+            self.assertTrue(t.is_read_only)
+
+        # Test tool execution through companion_ai
+        res = self.companion_ai.execute_tool("get_current_context")
+        self.assertTrue(res.success)
+        self.assertFalse(res.output["has_active_context"])
 
     def test_formatting_helpers(self):
         self.assertEqual(format_time(45), "45s")

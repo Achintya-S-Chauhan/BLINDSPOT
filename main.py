@@ -10,6 +10,7 @@ from understanding import ContextualUnderstandingAnalyzer
 from assistant import CompanionAssistant
 from ai import CompanionAI
 from conversation import ConversationSession
+from tools import create_default_tool_registry
 
 STABILITY_TIME = 1.5        # Time window must remain active before first OCR
 OCR_INTERVAL = 3.0          # Interval between periodic OCR scans in the same active window
@@ -183,6 +184,7 @@ def main():
     print("BLINDSPOT — quiet vision + OCR online\n")
 
     conversation = ConversationSession(maxlen=20)
+    history = ContextHistory(maxlen=50)
 
     # shared state
     state = {
@@ -197,13 +199,17 @@ def main():
         "candidate_start_time": None,
         "current_context": None,
         "previous_context_obj": None,
-        "history": ContextHistory(maxlen=50),
+        "history": history,
         "conversation": conversation,
     }
+
+    tool_registry = create_default_tool_registry(state=state, conversation=conversation, history=history)
+    state["tool_registry"] = tool_registry
+
     state_lock = threading.Lock()
     analyzer = ContextualUnderstandingAnalyzer()
     assistant = CompanionAssistant()
-    companion_ai = CompanionAI(conversation=conversation)
+    companion_ai = CompanionAI(conversation=conversation, tool_registry=tool_registry)
 
     # start monitor in background
     threading.Thread(target=monitor, args=(state, state_lock), daemon=True).start()
@@ -287,6 +293,16 @@ def main():
                     for turn in turns:
                         speaker = "User" if turn.role == "user" else "BLINDSPOT"
                         print(f"{speaker}: {turn.content}")
+
+            elif cmd == "tools":
+                tools_list = companion_ai.tools.list_tools()
+                print("\n[REGISTERED TOOLS]")
+                if not tools_list:
+                    print("No tools registered.")
+                else:
+                    for t in tools_list:
+                        safety_str = "read-only" if t.is_read_only else "mutating action"
+                        print(f"- {t.name} ({safety_str}): {t.description}")
 
             elif cmd in ("context", "understanding"):
                 with state_lock:

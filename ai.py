@@ -9,6 +9,7 @@ from context import DesktopContext
 from history import ContextHistory
 from understanding import WorkflowUnderstanding, format_duration
 from conversation import ConversationSession, ConversationTurn
+from tools import ToolRegistry, ToolResult
 
 
 class MissingAPIKeyError(Exception):
@@ -169,7 +170,12 @@ def format_context_payload(
 class LLMProvider:
     """Abstract interface for LLM providers."""
 
-    def generate_response(self, system_instruction: str, user_prompt: str) -> str:
+    def generate_response(
+        self,
+        system_instruction: str,
+        user_prompt: str,
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
         raise NotImplementedError
 
 
@@ -184,7 +190,12 @@ class GeminiProvider(LLMProvider):
         self.model = model
         self.timeout = timeout
 
-    def generate_response(self, system_instruction: str, user_prompt: str) -> str:
+    def generate_response(
+        self,
+        system_instruction: str,
+        user_prompt: str,
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
         if not self.api_key:
             raise MissingAPIKeyError(
                 "Gemini API key is not configured.\n"
@@ -323,13 +334,19 @@ class CompanionAI:
         self,
         provider: Optional[LLMProvider] = None,
         conversation: Optional[ConversationSession] = None,
+        tool_registry: Optional[ToolRegistry] = None,
     ):
         self.provider = provider or GeminiProvider()
         self.conversation = conversation if conversation is not None else ConversationSession()
+        self.tools = tool_registry if tool_registry is not None else ToolRegistry()
 
     def clear_conversation(self) -> None:
         """Reset the active conversation session."""
         self.conversation.clear()
+
+    def execute_tool(self, name: str, **kwargs) -> ToolResult:
+        """Execute a tool by name using the companion's ToolRegistry."""
+        return self.tools.execute(name, **kwargs)
 
     def ask(
         self,
@@ -360,10 +377,20 @@ class CompanionAI:
         prompt_text = payload.to_prompt_text()
 
         try:
-            response = self.provider.generate_response(
-                system_instruction=self.SYSTEM_INSTRUCTION,
-                user_prompt=prompt_text,
-            )
+            import inspect
+            tool_schemas = self.tools.get_tool_schemas() if len(self.tools) > 0 else None
+            sig = inspect.signature(self.provider.generate_response)
+            if "tools" in sig.parameters:
+                response = self.provider.generate_response(
+                    system_instruction=self.SYSTEM_INSTRUCTION,
+                    user_prompt=prompt_text,
+                    tools=tool_schemas,
+                )
+            else:
+                response = self.provider.generate_response(
+                    system_instruction=self.SYSTEM_INSTRUCTION,
+                    user_prompt=prompt_text,
+                )
             # Record user turn and assistant reply in conversation session
             active_session.add_user_message(user_query)
             active_session.add_assistant_message(response)
