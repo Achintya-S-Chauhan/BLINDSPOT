@@ -18,6 +18,7 @@ from tools import (
     BLOCKED_DANGEROUS_TOOL_NAMES,
 )
 from desktop_io import MockDesktopIO
+from task import TaskExecutor
 
 STABILITY_TIME = 1.5        # Time window must remain active before first OCR
 OCR_INTERVAL = 3.0          # Interval between periodic OCR scans in the same active window
@@ -245,6 +246,7 @@ def main():
     analyzer = ContextualUnderstandingAnalyzer()
     assistant = CompanionAssistant()
     companion_ai = CompanionAI(conversation=conversation, tool_registry=tool_registry)
+    task_executor = TaskExecutor(tool_registry=tool_registry)
 
     # start monitor in background
     threading.Thread(target=monitor, args=(state, state_lock), daemon=True).start()
@@ -285,6 +287,33 @@ def main():
                     print(f"Context:        {response.supporting_context['current_activity']} | {response.supporting_context.get('current_window') or ''}")
                 if response.supporting_context.get("flow"):
                     print(f"Flow:           {' -> '.join(response.supporting_context['flow'])}")
+
+            elif cmd.startswith("task"):
+                task_request = raw_input_line[4:].strip()
+                if not task_request:
+                    print("\n[TASK EXECUTION]")
+                    print("Please specify a task request. Example: task Open Notepad and focus it")
+                else:
+                    print(f"\n[PLANNING TASK]: {task_request}")
+                    task = companion_ai.plan_task(task_request)
+                    if not task.steps:
+                        print("Could not plan task: no applicable tools found for this request.")
+                    else:
+                        print(f"Task ID: {task.task_id} ({len(task.steps)} steps)")
+                        for s in task.steps:
+                            print(f"  Step {s.step_id}: {s.tool_name}({s.args}) — {s.description}")
+
+                        print("\n[EXECUTING TASK]")
+                        summary = task_executor.execute(task)
+                        print(f"\n[TASK RESULT]: {summary.status.value.upper()}")
+                        print(f"Executed: {summary.executed_steps}/{summary.total_steps} steps in {summary.duration_seconds:.2f}s")
+                        for sr in summary.step_results:
+                            status_sym = "[OK]" if sr["status"] == "completed" else "[STOPPED]"
+                            print(f"  {status_sym} Step {sr['step_id']}: {sr['tool_name']} -> {sr['status']}")
+                            if sr.get("error"):
+                                print(f"         Error: {sr['error']}")
+                        if summary.error:
+                            print(f"\nTask halted: {summary.error}")
 
             elif cmd.startswith("ask"):
                 question = raw_input_line[3:].strip()

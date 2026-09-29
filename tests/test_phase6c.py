@@ -902,15 +902,16 @@ class TestGeminiToolPayloadFormat(unittest.TestCase):
         self.assertEqual(tools_arr[0]["type"], "function")
 
     def test_88_initial_request_tools_has_function_declarations(self):
-        """tools[0] must also contain 'function_declarations'."""
+        """tools list contains function declaration with name and type."""
         from tools import GetCurrentContextTool
         schemas = [GetCurrentContextTool().to_schema()]
         body = self._captured_body(schemas, follow_up=False)
-        self.assertIn("function_declarations", body["tools"][0])
-        decls = body["tools"][0]["function_declarations"]
+        self.assertIn("tools", body)
+        decls = body["tools"]
         self.assertIsInstance(decls, list)
         self.assertEqual(len(decls), 1)
         self.assertEqual(decls[0]["name"], "get_current_context")
+        self.assertEqual(decls[0]["type"], "function")
 
     def test_89_follow_up_request_tools_has_type_field(self):
         """format_tool_results_for_interactions must also include type in tools[0]."""
@@ -932,7 +933,7 @@ class TestGeminiToolPayloadFormat(unittest.TestCase):
         self.assertNotIn("tools", body)
 
     def test_92_all_action_tool_schemas_are_included_in_declarations(self):
-        """All 10 registered tools appear in function_declarations."""
+        """All 10 registered tools appear in tools list."""
         from tools import create_default_tool_registry
         from desktop_io import MockDesktopIO
         registry = create_default_tool_registry(
@@ -942,7 +943,7 @@ class TestGeminiToolPayloadFormat(unittest.TestCase):
         )
         schemas = registry.get_tool_schemas()
         body = self._captured_body(schemas, follow_up=False)
-        decls = body["tools"][0]["function_declarations"]
+        decls = body["tools"]
         self.assertEqual(len(decls), 10)
         names = {d["name"] for d in decls}
         expected = {
@@ -953,7 +954,7 @@ class TestGeminiToolPayloadFormat(unittest.TestCase):
         self.assertEqual(names, expected)
 
     def test_93_each_function_declaration_has_required_fields(self):
-        """Each function declaration must have name, description, and parameters."""
+        """Each function declaration must have type, name, description, and parameters."""
         from tools import create_default_tool_registry
         from desktop_io import MockDesktopIO
         registry = create_default_tool_registry(
@@ -963,8 +964,9 @@ class TestGeminiToolPayloadFormat(unittest.TestCase):
         )
         schemas = registry.get_tool_schemas()
         body = self._captured_body(schemas, follow_up=False)
-        decls = body["tools"][0]["function_declarations"]
+        decls = body["tools"]
         for decl in decls:
+            self.assertEqual(decl.get("type"), "function")
             self.assertIn("name", decl, f"Missing 'name' in {decl}")
             self.assertIn("description", decl, f"Missing 'description' in {decl}")
             self.assertIn("parameters", decl, f"Missing 'parameters' in {decl}")

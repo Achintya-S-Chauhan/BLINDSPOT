@@ -474,14 +474,15 @@ class TestAICompanionCore(unittest.TestCase):
             # Verify call 1 had tool declarations
             first_body = mock_send.call_args_list[0][0][0]
             self.assertIn("tools", first_body)
-            self.assertEqual(first_body["tools"][0]["function_declarations"][0]["name"], "get_current_context")
+            self.assertEqual(first_body["tools"][0]["name"], "get_current_context")
+            self.assertEqual(first_body["tools"][0]["type"], "function")
 
-            # Verify call 2 passed previous_interaction_id and tool_result
+            # Verify call 2 passed previous_interaction_id and function_result
             second_body = mock_send.call_args_list[1][0][0]
             self.assertEqual(second_body["previous_interaction_id"], "interaction_step_1")
-            self.assertEqual(second_body["input"]["type"], "tool_result")
-            self.assertEqual(second_body["input"]["tool_result"]["name"], "get_current_context")
-            self.assertTrue(second_body["input"]["tool_result"]["output"]["has_active_context"])
+            self.assertEqual(second_body["input"][0]["type"], "function_result")
+            self.assertEqual(second_body["input"][0]["name"], "get_current_context")
+            self.assertTrue(second_body["input"][0]["result"]["has_active_context"])
 
     def test_20_gemini_provider_multiple_tool_calls_single_turn(self):
         """20. Test handling multiple tool calls issued simultaneously by Gemini."""
@@ -522,8 +523,10 @@ class TestAICompanionCore(unittest.TestCase):
             # Input should be a list of 2 tool results
             self.assertIsInstance(second_body["input"], list)
             self.assertEqual(len(second_body["input"]), 2)
-            self.assertEqual(second_body["input"][0]["tool_result"]["name"], "get_current_context")
-            self.assertEqual(second_body["input"][1]["tool_result"]["name"], "get_recent_activity")
+            self.assertEqual(second_body["input"][0]["type"], "function_result")
+            self.assertEqual(second_body["input"][0]["name"], "get_current_context")
+            self.assertEqual(second_body["input"][1]["type"], "function_result")
+            self.assertEqual(second_body["input"][1]["name"], "get_recent_activity")
 
     def test_21_gemini_provider_sequential_tool_calls_multi_turn(self):
         """21. Test multi-turn sequential tool calling (Tool A -> Result A -> Tool B -> Result B -> Final)."""
@@ -571,8 +574,9 @@ class TestAICompanionCore(unittest.TestCase):
 
             self.assertEqual(response, "I could not scan because tool is unavailable.")
             second_body = mock_send.call_args_list[1][0][0]
-            self.assertIn("error", second_body["input"]["tool_result"]["output"])
-            self.assertIn("not registered", second_body["input"]["tool_result"]["output"]["error"])
+            self.assertEqual(second_body["input"][0]["type"], "function_result")
+            self.assertIn("error", second_body["input"][0]["result"])
+            self.assertIn("not registered", second_body["input"][0]["result"]["error"])
 
     def test_23_gemini_provider_safety_boundary_blocks_action_tool(self):
         """23. Test that mutating action tools requested by Gemini are rejected by the safety boundary."""
@@ -593,7 +597,8 @@ class TestAICompanionCore(unittest.TestCase):
 
             self.assertEqual(response, "I was blocked by the safety boundary.")
             second_body = mock_send.call_args_list[1][0][0]
-            err_output = second_body["input"]["tool_result"]["output"]["error"]
+            self.assertEqual(second_body["input"][0]["type"], "function_result")
+            err_output = second_body["input"][0]["result"]["error"]
             self.assertIn("safety boundary", err_output)
 
     def test_24_companion_ai_with_gemini_tool_loop(self):

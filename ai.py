@@ -201,8 +201,9 @@ def parse_tool_calls(resp_data: Dict[str, Any]) -> List[ToolCall]:
                         args = json.loads(args)
                     except Exception:
                         args = {"raw": args}
+                call_id = call_info.get("id") or step.get("id") or call_info.get("call_id") or step.get("call_id")
                 if name:
-                    calls.append(ToolCall(name=name, args=args, call_id=call_info.get("id")))
+                    calls.append(ToolCall(name=name, args=args, call_id=call_id))
 
             content = step.get("content")
             if isinstance(content, list):
@@ -353,19 +354,21 @@ def format_tool_results_for_interactions(
     tools: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Build follow-up request body with tool results for Interactions API."""
-    steps_or_inputs = []
+    inputs = []
     for res in tool_results:
-        steps_or_inputs.append({
-            "type": "tool_result",
-            "tool_result": {
-                "name": res.tool_name,
-                "output": res.output if res.success else {"error": res.error},
-            }
-        })
+        item: Dict[str, Any] = {
+            "type": "function_result",
+            "name": res.tool_name,
+            "result": res.output if res.success else {"error": res.error},
+        }
+        call_id = res.metadata.get("call_id")
+        if call_id:
+            item["call_id"] = call_id
+        inputs.append(item)
 
     body: Dict[str, Any] = {
         "model": clean_model,
-        "input": steps_or_inputs if len(steps_or_inputs) > 1 else steps_or_inputs[0],
+        "input": inputs,
         "generation_config": {
             "temperature": 0.2,
             "max_output_tokens": 800,
@@ -473,6 +476,8 @@ class GeminiProvider(LLMProvider):
                 tool_results = []
                 for tc in tool_calls:
                     result = tool_registry.execute(tc.name, **tc.args)
+                    if tc.call_id and "call_id" not in result.metadata:
+                        result.metadata["call_id"] = tc.call_id
                     tool_results.append(result)
 
                 interaction_id = resp_data.get("id")
@@ -586,3 +591,142 @@ class CompanionAI:
             return f"[AI Provider Error] {e}"
         except Exception as e:
             return f"[AI Error] An unexpected error occurred: {e}"
+
+    TASK_PLANNING_SYSTEM_INSTRUCTION = (
+        "You are BLINDSPOT's task planning engine.\n"
+        "Convert the user's desktop task request into an explicit, sequential list of registered tool calls.\n"
+        "RULES:\n"
+        "1. You must ONLY choose tools from the provided schemas.\n"
+        "2. Return ONLY a valid JSON array of objects, with NO surrounding markdown or commentary.\n"
+        "3. Each object must have:\n"
+        "   - 'tool_name': name of the registered tool\n"
+        "   - 'args': dictionary of argument values\n"
+        "   - 'description': brief summary of what this step accomplishes\n"
+        "4. Maximum 5 steps.\n"
+        "5. Do NOT invent tools or parameters that are not in the schemas.\n"
+        "6. If the request cannot be fulfilled, return []."
+    )
+
+    def plan_task(self, user_request: str) -> "Task":
+        """
+        Convert a user's multi-step request into a structured Task with validated steps.
+        Uses Gemini if available, with deterministic fallback for standard commands.
+        """
+        from task import create_task, MAX_TASK_STEPS
+        schemas = self.tools.get_tool_schemas() if len(self.tools) > 0 else []
+        steps_data: List[Dict[str, Any]] = []
+
+        # Try prompting the LLM provider
+        try:
+            planning_prompt = (
+                f"User task request: {user_request}\n\n"
+                f"Available tool schemas:\n{json.dumps(schemas, indent=2)}\n\n"
+                "Return the sequential tool steps as a JSON array:"
+            )
+            kwargs: Dict[str, Any] = {
+                "system_instruction": self.TASK_PLANNING_SYSTEM_INSTRUCTION,
+                "user_prompt": planning_prompt,
+            }
+            resp = self.provider.generate_response(**kwargs)
+            parsed = self._extract_steps_json(resp)
+            if parsed:
+                # Validate tool names against registry
+                for step in parsed:
+                    if isinstance(step, dict) and self.tools.get(step.get("tool_name", "")):
+                        steps_data.append({
+                            "tool_name": step["tool_name"],
+                            "args": step.get("args") or {},
+                            "description": step.get("description", f"Execute {step['tool_name']}"),
+                        })
+        except Exception:
+            pass
+
+        # Deterministic fallback if provider did not return valid steps
+        if not steps_data:
+            steps_data = self._deterministic_task_fallback(user_request)
+
+        # Enforce step boundary
+        steps_data = steps_data[:MAX_TASK_STEPS]
+
+        return create_task(user_request=user_request, steps_data=steps_data)
+
+    def _extract_steps_json(self, text: str) -> List[Dict[str, Any]]:
+        """Extract and parse a JSON array of step dictionaries from model text."""
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            cleaned = "\n".join(lines).strip()
+
+        start = cleaned.find("[")
+        end = cleaned.rfind("]")
+        if start != -1 and end != -1 and end > start:
+            try:
+                data = json.loads(cleaned[start : end + 1])
+                if isinstance(data, list):
+                    return data
+            except Exception:
+                pass
+        return []
+
+    def _deterministic_task_fallback(self, user_request: str) -> List[Dict[str, Any]]:
+        """Rule-based fallback for standard desktop action patterns."""
+        from tools import ALLOWED_APPLICATIONS
+        req_lower = user_request.lower().strip()
+        steps = []
+        opened_app = None
+
+        # Check for open / launch application
+        for app in ALLOWED_APPLICATIONS:
+            if f"open {app}" in req_lower or f"launch {app}" in req_lower or req_lower == f"open {app}":
+                if self.tools.get("open_application"):
+                    steps.append({
+                        "tool_name": "open_application",
+                        "args": {"app_name": app},
+                        "description": f"Open {app.capitalize()}",
+                    })
+                    opened_app = app
+                break
+
+        # Check for focus / switch to application
+        focused_app = None
+        for app in ALLOWED_APPLICATIONS:
+            if f"focus {app}" in req_lower or f"switch to {app}" in req_lower:
+                if self.tools.get("focus_application"):
+                    steps.append({
+                        "tool_name": "focus_application",
+                        "args": {"window_title_fragment": app.capitalize()},
+                        "description": f"Focus {app.capitalize()}",
+                    })
+                    focused_app = app
+                break
+
+        # Check for "focus it" referencing the opened app
+        if not focused_app and opened_app and ("focus it" in req_lower or "focus" in req_lower or "bring to front" in req_lower):
+            if self.tools.get("focus_application"):
+                steps.append({
+                    "tool_name": "focus_application",
+                    "args": {"window_title_fragment": opened_app.capitalize()},
+                    "description": f"Focus {opened_app.capitalize()}",
+                })
+
+        # Check for inspection commands
+        if not steps:
+            if "context" in req_lower and self.tools.get("get_current_context"):
+                steps.append({
+                    "tool_name": "get_current_context",
+                    "args": {"include_ocr": True},
+                    "description": "Inspect current desktop context",
+                })
+            elif ("activity" in req_lower or "history" in req_lower) and self.tools.get("get_recent_activity"):
+                steps.append({
+                    "tool_name": "get_recent_activity",
+                    "args": {"limit": 5},
+                    "description": "Inspect recent activity history",
+                })
+
+        return steps
+
