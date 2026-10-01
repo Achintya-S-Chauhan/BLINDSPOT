@@ -611,12 +611,38 @@ class CompanionAI:
         """
         Convert a user's multi-step request into a structured Task with validated steps.
         Uses Gemini if available, with deterministic fallback for standard commands.
+        Rejects invalid plans cleanly rather than executing partial or corrupted plans.
         """
-        from task import create_task, MAX_TASK_STEPS
-        schemas = self.tools.get_tool_schemas() if len(self.tools) > 0 else []
-        steps_data: List[Dict[str, Any]] = []
+        from task import create_task, validate_task, TaskStatus, MAX_TASK_STEPS
+        from tools import validate_tool_args
+        import uuid
 
-        # Try prompting the LLM provider
+        tid = f"task_{uuid.uuid4().hex[:8]}"
+
+        if not isinstance(user_request, str) or not user_request.strip():
+            return create_task(
+                user_request=user_request or "",
+                steps_data=[],
+                task_id=tid,
+                status=TaskStatus.FAILED,
+                error="User task request cannot be empty.",
+            )
+
+        schemas = self.tools.get_tool_schemas() if len(self.tools) > 0 else []
+        if not schemas:
+            return create_task(
+                user_request=user_request,
+                steps_data=[],
+                task_id=tid,
+                status=TaskStatus.FAILED,
+                error="No tools are registered in ToolRegistry.",
+            )
+
+        llm_response = None
+        parsed = None
+        plan_err = None
+
+        # 1. Try prompting the LLM provider
         try:
             planning_prompt = (
                 f"User task request: {user_request}\n\n"
@@ -627,50 +653,192 @@ class CompanionAI:
                 "system_instruction": self.TASK_PLANNING_SYSTEM_INSTRUCTION,
                 "user_prompt": planning_prompt,
             }
-            resp = self.provider.generate_response(**kwargs)
-            parsed = self._extract_steps_json(resp)
-            if parsed:
-                # Validate tool names against registry
-                for step in parsed:
-                    if isinstance(step, dict) and self.tools.get(step.get("tool_name", "")):
-                        steps_data.append({
-                            "tool_name": step["tool_name"],
-                            "args": step.get("args") or {},
-                            "description": step.get("description", f"Execute {step['tool_name']}"),
-                        })
-        except Exception:
-            pass
+            llm_response = self.provider.generate_response(**kwargs)
+            parsed = self._extract_steps_json(llm_response)
+            if parsed is None and llm_response:
+                plan_err = "Plan rejected: Failed to extract valid JSON plan from model response."
+        except Exception as e:
+            parsed = None
+            plan_err = f"Plan rejected: Provider error ({e})"
 
-        # Deterministic fallback if provider did not return valid steps
-        if not steps_data:
-            steps_data = self._deterministic_task_fallback(user_request)
+        # 2. If the LLM returned parsed step data, validate it strictly
+        if parsed is not None:
+            if not isinstance(parsed, list):
+                return create_task(
+                    user_request=user_request,
+                    steps_data=[],
+                    task_id=tid,
+                    status=TaskStatus.FAILED,
+                    error="Plan rejected: Expected JSON array of steps.",
+                )
 
-        # Enforce step boundary
-        steps_data = steps_data[:MAX_TASK_STEPS]
+            if len(parsed) == 0:
+                return create_task(
+                    user_request=user_request,
+                    steps_data=[],
+                    task_id=tid,
+                    status=TaskStatus.FAILED,
+                    error="Plan rejected: Model returned an empty plan.",
+                )
 
-        return create_task(user_request=user_request, steps_data=steps_data)
+            if len(parsed) > MAX_TASK_STEPS:
+                return create_task(
+                    user_request=user_request,
+                    steps_data=[],
+                    task_id=tid,
+                    status=TaskStatus.FAILED,
+                    error=f"Plan rejected: Model plan exceeds maximum limit of {MAX_TASK_STEPS} steps (got {len(parsed)}).",
+                )
 
-    def _extract_steps_json(self, text: str) -> List[Dict[str, Any]]:
-        """Extract and parse a JSON array of step dictionaries from model text."""
-        cleaned = text.strip()
-        if cleaned.startswith("```"):
-            lines = cleaned.splitlines()
-            if lines and lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip().startswith("```"):
-                lines = lines[:-1]
-            cleaned = "\n".join(lines).strip()
+            steps_data: List[Dict[str, Any]] = []
+            seen_steps = []
+            for idx, step in enumerate(parsed, start=1):
+                if not isinstance(step, dict):
+                    return create_task(
+                        user_request=user_request,
+                        steps_data=[],
+                        task_id=tid,
+                        status=TaskStatus.FAILED,
+                        error=f"Plan rejected: Step {idx} is not a valid dictionary object.",
+                    )
 
-        start = cleaned.find("[")
-        end = cleaned.rfind("]")
-        if start != -1 and end != -1 and end > start:
+                tool_name = step.get("tool_name")
+                if not tool_name or not isinstance(tool_name, str) or not tool_name.strip():
+                    return create_task(
+                        user_request=user_request,
+                        steps_data=[],
+                        task_id=tid,
+                        status=TaskStatus.FAILED,
+                        error=f"Plan rejected: Step {idx} is missing a valid 'tool_name'.",
+                    )
+
+                tool_name_clean = tool_name.strip()
+                tool = self.tools.get(tool_name_clean)
+                if not tool:
+                    return create_task(
+                        user_request=user_request,
+                        steps_data=[],
+                        task_id=tid,
+                        status=TaskStatus.FAILED,
+                        error=f"Plan rejected: Model requested unknown tool '{tool_name_clean}'.",
+                    )
+
+                args = step.get("args")
+                if args is None:
+                    args = {}
+                if not isinstance(args, dict):
+                    return create_task(
+                        user_request=user_request,
+                        steps_data=[],
+                        task_id=tid,
+                        status=TaskStatus.FAILED,
+                        error=f"Plan rejected: Step {idx} ({tool_name_clean}) arguments must be a dictionary.",
+                    )
+
+                is_valid_args, arg_err = validate_tool_args(tool, args)
+                if not is_valid_args:
+                    return create_task(
+                        user_request=user_request,
+                        steps_data=[],
+                        task_id=tid,
+                        status=TaskStatus.FAILED,
+                        error=f"Plan rejected: Invalid arguments for tool '{tool_name_clean}': {arg_err}",
+                    )
+
+                # Duplicate consecutive step check
+                step_sig = (tool_name_clean, json.dumps(args, sort_keys=True))
+                if seen_steps and seen_steps[-1] == step_sig:
+                    return create_task(
+                        user_request=user_request,
+                        steps_data=[],
+                        task_id=tid,
+                        status=TaskStatus.FAILED,
+                        error=f"Plan rejected: Model plan contains duplicate consecutive step '{tool_name_clean}'.",
+                    )
+                seen_steps.append(step_sig)
+
+                steps_data.append({
+                    "tool_name": tool_name_clean,
+                    "args": args,
+                    "description": step.get("description", f"Execute {tool_name_clean}"),
+                })
+
+            task = create_task(user_request=user_request, steps_data=steps_data, task_id=tid)
+            is_valid, val_err = validate_task(task, self.tools, MAX_TASK_STEPS)
+            if not is_valid:
+                task.status = TaskStatus.FAILED
+                task.error = f"Plan rejected: {val_err}"
+                task.steps = []
+            return task
+
+        # 3. Deterministic fallback if provider was unavailable or did not return JSON
+        fallback_steps = self._deterministic_task_fallback(user_request)
+        if fallback_steps:
+            task = create_task(user_request=user_request, steps_data=fallback_steps, task_id=tid)
+            is_valid, val_err = validate_task(task, self.tools, MAX_TASK_STEPS)
+            if is_valid:
+                return task
+
+        # 4. If neither worked, return a failed task cleanly
+        return create_task(
+            user_request=user_request,
+            steps_data=[],
+            task_id=tid,
+            status=TaskStatus.FAILED,
+            error=plan_err or "Could not plan task from user request.",
+        )
+
+    def _extract_steps_json(self, text: Any) -> Optional[List[Dict[str, Any]]]:
+        """
+        Extract and parse a JSON array of step dictionaries from model text.
+        Handles markdown fences, preamble/postamble explanatory text, and nested step objects.
+        Returns list of step dicts if parseable, else None.
+        """
+        if not isinstance(text, str) or not text.strip():
+            return None
+
+        import re
+
+        # Strategy 1: Look for markdown code blocks ```json ... ``` or ``` ... ```
+        code_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+        for block in code_blocks:
+            candidate = block.strip()
             try:
-                data = json.loads(cleaned[start : end + 1])
+                data = json.loads(candidate)
+                if isinstance(data, list):
+                    return data
+                elif isinstance(data, dict):
+                    for key in ("steps", "plan", "tools", "actions", "task"):
+                        if isinstance(data.get(key), list):
+                            return data[key]
+            except Exception:
+                pass
+
+        # Strategy 2: Look for outermost JSON array [...]
+        start_arr = text.find("[")
+        end_arr = text.rfind("]")
+        if start_arr != -1 and end_arr != -1 and end_arr > start_arr:
+            try:
+                data = json.loads(text[start_arr : end_arr + 1])
                 if isinstance(data, list):
                     return data
             except Exception:
                 pass
-        return []
+
+        # Strategy 3: Look for outermost JSON object {...}
+        start_obj = text.find("{")
+        end_obj = text.rfind("}")
+        if start_obj != -1 and end_obj != -1 and end_obj > start_obj:
+            try:
+                data = json.loads(text[start_obj : end_obj + 1])
+                if isinstance(data, dict):
+                    for key in ("steps", "plan", "tools", "actions", "task"):
+                        if isinstance(data.get(key), list):
+                            return data[key]
+            except Exception:
+                pass
+
+        return None
 
     def _deterministic_task_fallback(self, user_request: str) -> List[Dict[str, Any]]:
         """Rule-based fallback for standard desktop action patterns."""
@@ -729,4 +897,5 @@ class CompanionAI:
                 })
 
         return steps
+
 

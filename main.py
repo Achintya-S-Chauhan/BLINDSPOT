@@ -18,7 +18,7 @@ from tools import (
     BLOCKED_DANGEROUS_TOOL_NAMES,
 )
 from desktop_io import MockDesktopIO
-from task import TaskExecutor
+from task import TaskExecutor, TaskStatus, validate_task
 
 STABILITY_TIME = 1.5        # Time window must remain active before first OCR
 OCR_INTERVAL = 3.0          # Interval between periodic OCR scans in the same active window
@@ -296,24 +296,47 @@ def main():
                 else:
                     print(f"\n[PLANNING TASK]: {task_request}")
                     task = companion_ai.plan_task(task_request)
-                    if not task.steps:
-                        print("Could not plan task: no applicable tools found for this request.")
+                    if task.status == TaskStatus.FAILED or not task.steps:
+                        print("\n[TASK PLANNING REJECTED]")
+                        print(f"Reason: {task.error or 'No valid executable plan could be formulated.'}")
                     else:
-                        print(f"Task ID: {task.task_id} ({len(task.steps)} steps)")
-                        for s in task.steps:
-                            print(f"  Step {s.step_id}: {s.tool_name}({s.args}) — {s.description}")
+                        is_valid, val_err = validate_task(task, tool_registry)
+                        if not is_valid:
+                            print(f"\n[TASK VALIDATION REJECTED]")
+                            print(f"Reason: {val_err}")
+                        else:
+                            step_plural = "s" if len(task.steps) != 1 else ""
+                            print(f"\n[PLANNED TASK]: {task.user_request}")
+                            print(f"Task ID: {task.task_id} ({len(task.steps)} step{step_plural})")
+                            for s in task.steps:
+                                args_repr = ", ".join(f"{k}={v!r}" for k, v in s.args.items()) if s.args else "none"
+                                desc_str = f" — {s.description}" if s.description else ""
+                                print(f"  Step {s.step_id}: {s.tool_name}({args_repr}){desc_str}")
 
-                        print("\n[EXECUTING TASK]")
-                        summary = task_executor.execute(task)
-                        print(f"\n[TASK RESULT]: {summary.status.value.upper()}")
-                        print(f"Executed: {summary.executed_steps}/{summary.total_steps} steps in {summary.duration_seconds:.2f}s")
-                        for sr in summary.step_results:
-                            status_sym = "[OK]" if sr["status"] == "completed" else "[STOPPED]"
-                            print(f"  {status_sym} Step {sr['step_id']}: {sr['tool_name']} -> {sr['status']}")
-                            if sr.get("error"):
-                                print(f"         Error: {sr['error']}")
-                        if summary.error:
-                            print(f"\nTask halted: {summary.error}")
+                            print("\n[EXECUTING TASK]")
+                            summary = task_executor.execute(task, pre_validate=True)
+                            print(f"\n[TASK RESULT]: {summary.status.value.upper()}")
+                            print(f"Progress: {summary.successful_steps}/{summary.total_steps} completed ({summary.executed_steps} executed) in {summary.duration_seconds:.2f}s")
+                            for sr in summary.step_results:
+                                if sr["status"] == "completed":
+                                    sym = "[OK]"
+                                elif sr["status"] == "blocked":
+                                    sym = "[BLOCKED]"
+                                else:
+                                    sym = "[FAILED]"
+                                print(f"  {sym} Step {sr['step_id']}: {sr['tool_name']}")
+                                if sr.get("output"):
+                                    out_preview = str(sr["output"]).strip()
+                                    if "\n" in out_preview:
+                                        out_preview = out_preview.split("\n")[0] + "..."
+                                    if len(out_preview) > 80:
+                                        out_preview = out_preview[:77] + "..."
+                                    print(f"       Result: {out_preview}")
+                                if sr.get("error"):
+                                    print(f"       Reason: {sr['error']}")
+
+                            if summary.status != TaskStatus.COMPLETED and summary.error:
+                                print(f"\nTask halted: {summary.error}")
 
             elif cmd.startswith("ask"):
                 question = raw_input_line[3:].strip()

@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 import enum
 import threading
 import time
-from typing import Optional, List, Dict, Any, Callable
+from typing import Optional, List, Dict, Any, Callable, Tuple
 from context import DesktopContext
 from history import ContextHistory
 from understanding import format_duration
@@ -697,6 +697,89 @@ def _validate_text(text: Any) -> Optional[str]:
             f"text length ({len(text)}) exceeds maximum allowed length ({MAX_TYPE_TEXT_LENGTH})."
         )
     return None
+
+
+def validate_tool_args(tool: "BaseTool", args: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """
+    Validate that arguments match the tool's schema, required fields, and constraints.
+    Returns (True, None) if valid, or (False, error_message).
+    """
+    if not isinstance(args, dict):
+        return False, f"Arguments for tool '{tool.name}' must be a dictionary, got {type(args).__name__}."
+
+    # 1. Check required parameters from schema
+    required = tool.parameters.get("required", [])
+    for req_field in required:
+        if req_field not in args:
+            return False, f"Missing required parameter '{req_field}' for tool '{tool.name}'."
+
+    # 2. Check property types
+    props = tool.parameters.get("properties", {})
+    for key, val in args.items():
+        if key in props:
+            expected_type = props[key].get("type")
+            if expected_type == "string" and not isinstance(val, str):
+                return False, f"Parameter '{key}' for tool '{tool.name}' must be a string, got {type(val).__name__}."
+            elif expected_type == "integer" and (not isinstance(val, int) or isinstance(val, bool)):
+                return False, f"Parameter '{key}' for tool '{tool.name}' must be an integer, got {type(val).__name__}."
+            elif expected_type == "number" and (not isinstance(val, (int, float)) or isinstance(val, bool)):
+                return False, f"Parameter '{key}' for tool '{tool.name}' must be a number, got {type(val).__name__}."
+            elif expected_type == "boolean" and not isinstance(val, bool):
+                return False, f"Parameter '{key}' for tool '{tool.name}' must be a boolean, got {type(val).__name__}."
+            elif expected_type == "array" and not isinstance(val, list):
+                return False, f"Parameter '{key}' for tool '{tool.name}' must be a list, got {type(val).__name__}."
+
+    # 3. Tool-specific domain validation
+    if tool.name == "open_application":
+        err = _validate_app_name(args.get("app_name", ""))
+        if err:
+            return False, err
+    elif tool.name == "focus_application":
+        frag = args.get("window_title_fragment", "")
+        if not isinstance(frag, str) or not frag.strip():
+            return False, "window_title_fragment must be a non-empty string."
+        if len(frag) > 200:
+            return False, "window_title_fragment is too long (max 200 characters)."
+    elif tool.name == "move_mouse":
+        err = _validate_coordinates(args.get("x"), args.get("y"))
+        if err:
+            return False, err
+        duration = args.get("duration", 0.2)
+        if not isinstance(duration, (int, float)) or duration < 0 or duration > 10:
+            return False, "duration must be a number in [0, 10] seconds."
+    elif tool.name == "click":
+        err = _validate_coordinates(args.get("x"), args.get("y"))
+        if err:
+            return False, err
+        button = args.get("button", "left")
+        err = _validate_mouse_button(button)
+        if err:
+            return False, err
+        clicks = args.get("clicks", 1)
+        if not isinstance(clicks, int) or clicks < 1 or clicks > 3:
+            return False, "clicks must be an integer in [1, 3]."
+    elif tool.name == "type_text":
+        err = _validate_text(args.get("text", ""))
+        if err:
+            return False, err
+        interval = args.get("interval", 0.02)
+        if not isinstance(interval, (int, float)) or interval < 0 or interval > 1:
+            return False, "interval must be a number in [0, 1] seconds."
+    elif tool.name == "press_key":
+        err = _validate_key(args.get("key", ""))
+        if err:
+            return False, err
+    elif tool.name == "hotkey":
+        keys = args.get("keys", [])
+        if not isinstance(keys, list):
+            return False, "keys must be a list of key name strings."
+        keys_tuple = tuple(k.lower() if isinstance(k, str) else k for k in keys)
+        err = _validate_hotkey_keys(keys_tuple)
+        if err:
+            return False, err
+
+    return True, None
+
 
 
 # ============================================================
