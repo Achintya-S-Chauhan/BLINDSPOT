@@ -13,6 +13,7 @@ import time
 import uuid
 from typing import Optional, List, Dict, Any, Tuple
 from tools import ToolRegistry, ToolResult
+from verification import StepVerificationResult, VerificationStatus, TaskVerifier
 
 
 # Maximum allowable steps in a single task to prevent runaway chains
@@ -49,6 +50,7 @@ class TaskStep:
     description: str = ""
     status: StepStatus = StepStatus.PENDING
     result: Optional[ToolResult] = None
+    verification: Optional[StepVerificationResult] = None
     error: Optional[str] = None
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
@@ -62,6 +64,7 @@ class TaskStep:
             "description": self.description,
             "status": self.status.value,
             "result": self.result.to_dict() if self.result else None,
+            "verification": self.verification.to_dict() if self.verification else None,
             "error": self.error,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
@@ -127,6 +130,14 @@ class TaskExecutionSummary:
     duration_seconds: float = 0.0
     step_results: List[Dict[str, Any]] = field(default_factory=list)
 
+    @property
+    def verified_steps(self) -> int:
+        """Return count of steps that were successfully verified."""
+        return sum(
+            1 for sr in self.step_results
+            if sr.get("verification") and sr["verification"].get("status") == "verified"
+        )
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize execution summary to dictionary representation."""
         return {
@@ -136,6 +147,7 @@ class TaskExecutionSummary:
             "total_steps": self.total_steps,
             "executed_steps": self.executed_steps,
             "successful_steps": self.successful_steps,
+            "verified_steps": self.verified_steps,
             "failed_step_id": self.failed_step_id,
             "error": self.error,
             "duration_seconds": self.duration_seconds,
@@ -231,10 +243,22 @@ class TaskExecutor:
        PENDING -> RUNNING -> BLOCKED
     """
 
-    def __init__(self, tool_registry: ToolRegistry, max_steps: int = MAX_TASK_STEPS, pre_validate: bool = False):
+    def __init__(
+        self,
+        tool_registry: ToolRegistry,
+        max_steps: int = MAX_TASK_STEPS,
+        pre_validate: bool = False,
+        verifier: Optional[Any] = None,
+    ):
         self.tool_registry = tool_registry
         self.max_steps = max_steps
         self.pre_validate = pre_validate
+        if verifier is None:
+            self.verifier: Optional[TaskVerifier] = TaskVerifier()
+        elif verifier is False:
+            self.verifier = None
+        else:
+            self.verifier = verifier
         self._lock = threading.Lock()
 
     def execute(self, task: Task, pre_validate: Optional[bool] = None) -> TaskExecutionSummary:
@@ -339,6 +363,20 @@ class TaskExecutor:
                 step.completed_at = time.time()
 
                 if res.success:
+                    # Verification Gate: verify step if verifier is configured
+                    if self.verifier:
+                        v_res = self.verifier.verify_step(step, tool=tool)
+                        step.verification = v_res
+                        if v_res.status == VerificationStatus.FAILED:
+                            step.status = StepStatus.FAILED
+                            step.error = f"Verification failed: {v_res.message}"
+                            task.status = TaskStatus.FAILED
+                            task.error = f"Step {step.step_id} ({step.tool_name}) verification failed: {v_res.message}"
+                            failed_step_id = step.step_id
+                            step_results.append(step.to_dict())
+                            # HALT IMMEDIATELY on verification failure
+                            break
+
                     step.status = StepStatus.COMPLETED
                     successful_count += 1
                     step_results.append(step.to_dict())
