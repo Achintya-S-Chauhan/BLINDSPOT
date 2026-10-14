@@ -1,8 +1,15 @@
 """
-BLINDSPOT — Phase 7A: Task Execution Foundation.
+BLINDSPOT — Phase 7A–7E: Task Execution Foundation with Dependency-Aware Planning.
 
 Provides structured task representations, task steps, and sequential execution
 through ToolRegistry with strict safety boundaries.
+
+Phase 7E additions:
+- TaskStep.depends_on: explicit list of prerequisite step IDs.
+- validate_task: dependency graph validation (missing refs, self-deps, cycles,
+  duplicates) before any tool invocation.
+- topological_sort_steps: deterministic step ordering respecting declared deps.
+- TaskExecutor: prerequisite enforcement; steps with unsatisfied deps are BLOCKED.
 """
 
 from dataclasses import dataclass, field
@@ -11,7 +18,7 @@ import json
 import threading
 import time
 import uuid
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Set
 from tools import ToolRegistry, ToolResult
 from verification import StepVerificationResult, VerificationStatus, TaskVerifier
 from recovery import FailureType, RecoveryDecision, RecoveryRecord, RetryPolicy
@@ -44,11 +51,16 @@ class TaskStep:
     """
     Explicit registered tool invocation within a task.
     No hidden execution; every step is inspected and recorded.
+
+    Phase 7E: depends_on lists prerequisite step IDs that must have
+    reached StepStatus.COMPLETED before this step may execute.
+    An empty list (default) means no prerequisites — backward compatible.
     """
     step_id: int
     tool_name: str
     args: Dict[str, Any] = field(default_factory=dict)
     description: str = ""
+    depends_on: List[int] = field(default_factory=list)
     status: StepStatus = StepStatus.PENDING
     result: Optional[ToolResult] = None
     verification: Optional[StepVerificationResult] = None
@@ -66,6 +78,7 @@ class TaskStep:
             "tool_name": self.tool_name,
             "args": self.args,
             "description": self.description,
+            "depends_on": self.depends_on,
             "status": self.status.value,
             "result": self.result.to_dict() if self.result else None,
             "verification": self.verification.to_dict() if self.verification else None,
@@ -188,6 +201,13 @@ def validate_task(
     6. All required parameters defined in tool's schema must be present in step.args.
     7. Argument types must match basic expected JSON schema types.
     8. No duplicate identical consecutive steps.
+    9. (Phase 7E) Dependency graph must be valid:
+       - depends_on must be a list of integers.
+       - All referenced step IDs must exist in the task.
+       - No step may depend on itself.
+       - No duplicate entries within depends_on of a single step.
+       - No duplicate step IDs across all steps.
+       - The dependency graph must be acyclic (no cycles).
     """
     from tools import BLOCKED_DANGEROUS_TOOL_NAMES, validate_tool_args
 
@@ -203,11 +223,19 @@ def validate_task(
     if len(task.steps) > max_steps:
         return False, f"Task step count ({len(task.steps)}) exceeds maximum allowed limit of {max_steps} steps."
 
-    seen_steps: List[Tuple[str, str]] = []
+    # --- Phase 7E: Duplicate step_id check ---
+    seen_step_ids: Set[int] = set()
     for idx, step in enumerate(task.steps, start=1):
         if not isinstance(step, TaskStep):
             return False, f"Step {idx} is not a valid TaskStep object."
+        if step.step_id in seen_step_ids:
+            return False, f"Duplicate step_id {step.step_id} found (at position {idx})."
+        seen_step_ids.add(step.step_id)
 
+    all_step_ids = seen_step_ids
+
+    seen_steps: List[Tuple[str, str]] = []
+    for idx, step in enumerate(task.steps, start=1):
         tool_name = step.tool_name
         if not tool_name or not isinstance(tool_name, str) or not tool_name.strip():
             return False, f"Step {idx} missing valid tool_name."
@@ -237,7 +265,118 @@ def validate_task(
             return False, f"Step {idx} ({tool_name_clean}) is an unnecessary duplicate of preceding step."
         seen_steps.append(step_sig)
 
+        deps = step.depends_on
+        if not isinstance(deps, list) or isinstance(deps, (str, bytes)):
+            return False, (
+                f"Step {idx} (id={step.step_id}): 'depends_on' must be a list, "
+                f"got {type(deps).__name__}."
+            )
+        seen_dep_ids: Set[int] = set()
+        for dep_id in deps:
+            if not isinstance(dep_id, int) or isinstance(dep_id, bool):
+                return False, (
+                    f"Step {idx} (id={step.step_id}): dependency ID must be an integer, "
+                    f"got {type(dep_id).__name__} ({dep_id!r})."
+                )
+            if dep_id == step.step_id:
+                return False, (
+                    f"Step {idx} (id={step.step_id}) declares a self-dependency."
+                )
+            if dep_id not in all_step_ids:
+                return False, (
+                    f"Step {idx} (id={step.step_id}) depends on step {dep_id} "
+                    "which does not exist in this task."
+                )
+            if dep_id in seen_dep_ids:
+                return False, (
+                    f"Step {idx} (id={step.step_id}) has duplicate dependency reference {dep_id}."
+                )
+            seen_dep_ids.add(dep_id)
+
+    # --- Phase 7E: Cycle detection (Kahn's algorithm) ---
+    ok, cycle_err = _validate_no_dependency_cycle(task.steps)
+    if not ok:
+        return False, cycle_err
+
     return True, None
+
+
+def _validate_no_dependency_cycle(steps: List["TaskStep"]) -> Tuple[bool, Optional[str]]:
+    """
+    Detect dependency cycles using Kahn's topological sort algorithm.
+    Returns (True, None) if acyclic, or (False, error_message) if a cycle exists.
+    """
+    step_ids = {s.step_id for s in steps}
+    # Build adjacency list: dep_id -> [steps that depend on dep_id]
+    # and in-degree map
+    in_degree: Dict[int, int] = {s.step_id: 0 for s in steps}
+    successors: Dict[int, List[int]] = {s.step_id: [] for s in steps}
+    for step in steps:
+        for dep_id in step.depends_on:
+            in_degree[step.step_id] += 1
+            successors[dep_id].append(step.step_id)
+
+    queue = [sid for sid in in_degree if in_degree[sid] == 0]
+    queue.sort()  # deterministic
+    visited = 0
+    while queue:
+        node = queue.pop(0)
+        visited += 1
+        for succ in sorted(successors[node]):
+            in_degree[succ] -= 1
+            if in_degree[succ] == 0:
+                queue.append(succ)
+
+    if visited != len(steps):
+        # Find the step IDs involved in the cycle for a useful message
+        in_cycle = [sid for sid, deg in in_degree.items() if deg > 0]
+        return False, (
+            f"Dependency cycle detected among step IDs: {sorted(in_cycle)}. "
+            "All task steps must form a directed acyclic graph."
+        )
+    return True, None
+
+
+def topological_sort_steps(steps: List["TaskStep"]) -> List["TaskStep"]:
+    """
+    Return steps in a valid execution order respecting declared dependencies.
+    Preserves original list order among steps with equal dependency rank
+    (stable topological sort using Kahn's algorithm).
+
+    Precondition: steps form a valid DAG (call validate_task first).
+    """
+    in_degree: Dict[int, int] = {s.step_id: 0 for s in steps}
+    successors: Dict[int, List[int]] = {s.step_id: [] for s in steps}
+    id_to_step: Dict[int, "TaskStep"] = {s.step_id: s for s in steps}
+    # Build using original list positions for stable ordering
+    original_order: Dict[int, int] = {s.step_id: i for i, s in enumerate(steps)}
+
+    for step in steps:
+        for dep_id in step.depends_on:
+            in_degree[step.step_id] += 1
+            successors[dep_id].append(step.step_id)
+
+    # Priority queue ordered by (in_degree==0), then original index for stability
+    available = sorted(
+        [sid for sid, deg in in_degree.items() if deg == 0],
+        key=lambda sid: original_order[sid],
+    )
+    result: List["TaskStep"] = []
+    while available:
+        node = available.pop(0)
+        result.append(id_to_step[node])
+        newly_ready = []
+        for succ in successors[node]:
+            in_degree[succ] -= 1
+            if in_degree[succ] == 0:
+                newly_ready.append(succ)
+        # Insert newly-ready successors in original-order position
+        newly_ready.sort(key=lambda sid: original_order[sid])
+        available = sorted(
+            available + newly_ready,
+            key=lambda sid: original_order[sid],
+        )
+    return result
 
 
 class TaskExecutor:
@@ -292,28 +431,41 @@ class TaskExecutor:
         """
         with self._lock:
             now = time.time()
-            task.started_at = now
-            task.status = TaskStatus.RUNNING
 
-            # Check if task already in terminal failed state
-            if task.status == TaskStatus.FAILED or (task.error and not task.steps):
-                task.status = TaskStatus.FAILED
+            # Check if task already in terminal failed/blocked state BEFORE overwriting status.
+            # This handles tasks that were pre-rejected by plan_task() or validate_task().
+            if task.status in (TaskStatus.FAILED, TaskStatus.BLOCKED) or (
+                task.error and not task.steps
+            ):
                 task.completed_at = now
+                terminal_status = (
+                    task.status
+                    if task.status in (TaskStatus.FAILED, TaskStatus.BLOCKED)
+                    else TaskStatus.FAILED
+                )
+                term_failure_type = (
+                    FailureType.PERMISSION_DENIED.value
+                    if terminal_status == TaskStatus.BLOCKED
+                    else FailureType.VALIDATION_ERROR.value
+                )
                 return TaskExecutionSummary(
                     task_id=task.task_id,
-                    status=TaskStatus.FAILED,
+                    status=terminal_status,
                     user_request=task.user_request,
                     total_steps=len(task.steps),
                     executed_steps=0,
                     successful_steps=0,
                     failed_step_id=task.steps[0].step_id if task.steps else None,
-                    failure_type=FailureType.VALIDATION_ERROR.value,
+                    failure_type=term_failure_type,
                     retry_attempts=0,
                     skipped_steps=len(task.steps),
                     skipped_step_ids=[s.step_id for s in task.steps],
                     error=task.error or "Task failed prior to execution",
                     duration_seconds=0.0,
                 )
+
+            task.started_at = now
+            task.status = TaskStatus.RUNNING
 
             # Check step count boundary
             if len(task.steps) > self.max_steps:
@@ -380,7 +532,57 @@ class TaskExecutor:
             task_failure_type: Optional[str] = None
             step_results: List[Dict[str, Any]] = []
 
-            for step in task.steps:
+            # Phase 7E: Compute topological execution order.
+            # topological_sort_steps requires a valid DAG (pre-validation ensures this).
+            ordered_steps = topological_sort_steps(task.steps)
+
+            # Track which step_ids have completed successfully for prerequisite checks.
+            completed_ids: Set[int] = set()
+
+            for step in ordered_steps:
+                # --- Phase 7E: Prerequisite enforcement ---
+                # A step may only run when ALL its prerequisites are COMPLETED.
+                # Any other terminal state (FAILED, BLOCKED) halts this step.
+                unsatisfied_prereqs = [dep for dep in step.depends_on if dep not in completed_ids]
+                if unsatisfied_prereqs:
+                    # Check whether any prerequisite reached a non-COMPLETED terminal state.
+                    id_to_step_map = {s.step_id: s for s in task.steps}
+                    failed_prereqs = [
+                        dep for dep in step.depends_on
+                        if id_to_step_map.get(dep, None) is not None
+                        and id_to_step_map[dep].status in (StepStatus.FAILED, StepStatus.BLOCKED)
+                    ]
+                    if failed_prereqs:
+                        # A prerequisite failed — block this step and halt.
+                        step.status = StepStatus.BLOCKED
+                        step.completed_at = time.time()
+                        step.error = (
+                            f"Prerequisite step(s) {failed_prereqs} did not complete successfully; "
+                            "this step is blocked."
+                        )
+                        step.recovery = RecoveryRecord(
+                            failure_type=FailureType.VALIDATION_ERROR,
+                            decision=RecoveryDecision.ABORT,
+                            attempt=0,
+                            max_retries=0,
+                            error=step.error,
+                            retryable=False,
+                            message="Step blocked because a prerequisite step failed or was blocked.",
+                        )
+                        if task.status == TaskStatus.RUNNING:
+                            task.status = TaskStatus.FAILED
+                            task.error = step.error
+                        if failed_step_id is None:
+                            failed_step_id = step.step_id
+                            task_failure_type = FailureType.VALIDATION_ERROR.value
+                        step_results.append(step.to_dict())
+                        # Preserve fail-fast: stop executing further steps.
+                        break
+                    else:
+                        # Prerequisites are pending (execution halted upstream — should not happen
+                        # after a break, but guard defensively).
+                        break
+
                 step.started_at = time.time()
                 step.status = StepStatus.RUNNING
                 executed_count += 1
@@ -419,6 +621,7 @@ class TaskExecutor:
                 while True:
                     attempt += 1
                     step.attempts = attempt
+                    step.verification = None  # Reset verification so previous failed/stale attempts do not persist
 
                     # Execute tool strictly through ToolRegistry
                     res: ToolResult = self.tool_registry.execute(step.tool_name, **step.args)
@@ -505,6 +708,7 @@ class TaskExecutor:
                         step.status = StepStatus.COMPLETED
                         successful_count += 1
                         step_success = True
+                        completed_ids.add(step.step_id)  # Phase 7E: track completed
                         step.recovery = RecoveryRecord(
                             failure_type=FailureType.NONE,
                             decision=RecoveryDecision.NONE,
@@ -521,11 +725,41 @@ class TaskExecutor:
                     # Halt task execution immediately; subsequent steps remain PENDING
                     break
 
+            # --- Phase 7E: Post-loop BLOCKED marking ---
+            # Any PENDING step whose prerequisite has FAILED or BLOCKED status is
+            # explicitly marked BLOCKED to distinguish it from a step skipped by fail-fast.
+            # We iterate in topological order so transitive dependencies are marked in one pass.
+            id_to_step_post = {s.step_id: s for s in task.steps}
+            for step in ordered_steps:
+                if step.status != StepStatus.PENDING:
+                    continue
+                failed_prereqs_post = [
+                    dep for dep in step.depends_on
+                    if id_to_step_post.get(dep) is not None
+                    and id_to_step_post[dep].status in (StepStatus.FAILED, StepStatus.BLOCKED)
+                ]
+                if failed_prereqs_post:
+                    step.status = StepStatus.BLOCKED
+                    step.completed_at = time.time()
+                    step.error = (
+                        f"Prerequisite step(s) {failed_prereqs_post} did not complete successfully; "
+                        "this step is blocked."
+                    )
+                    step.recovery = RecoveryRecord(
+                        failure_type=FailureType.VALIDATION_ERROR,
+                        decision=RecoveryDecision.ABORT,
+                        attempt=0,
+                        max_retries=0,
+                        error=step.error,
+                        retryable=False,
+                        message="Step blocked because a prerequisite step failed or was blocked.",
+                    )
+
             task.completed_at = time.time()
             if task.status == TaskStatus.RUNNING:
                 task.status = TaskStatus.COMPLETED
 
-            skipped_steps_list = [s for s in task.steps if s.status == StepStatus.PENDING]
+            skipped_steps_list = [s for s in task.steps if s.started_at is None]
             skipped_count = len(skipped_steps_list)
             skipped_ids = [s.step_id for s in skipped_steps_list]
 
@@ -556,15 +790,26 @@ def create_task(
 ) -> Task:
     """
     Factory to construct a Task with validated TaskSteps.
+
+    Phase 7E: If a step dict contains 'depends_on', it is preserved on the step
+    for strict validation by validate_task(). If omitted or None, it defaults to []
+    for backward compatibility with existing plans.
     """
     tid = task_id or f"task_{uuid.uuid4().hex[:8]}"
     steps: List[TaskStep] = []
     for idx, sdata in enumerate(steps_data, start=1):
+        # If 'depends_on' omitted, default to empty list (backward compatibility).
+        # If present with explicit null, keep as None so validation rejects it.
+        if "depends_on" in sdata:
+            deps = sdata["depends_on"]  # may be None or malformed; validation will handle
+        else:
+            deps = []
         step = TaskStep(
             step_id=idx,
             tool_name=sdata.get("tool_name", ""),
             args=sdata.get("args") or {},
             description=sdata.get("description", ""),
+            depends_on=deps,
         )
         steps.append(step)
 

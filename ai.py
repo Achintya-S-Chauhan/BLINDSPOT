@@ -602,6 +602,9 @@ class CompanionAI:
         "   - 'tool_name': name of the registered tool\n"
         "   - 'args': dictionary of argument values\n"
         "   - 'description': brief summary of what this step accomplishes\n"
+        "   - 'depends_on': (optional) list of 1-based step numbers that must complete "
+        "before this step. Omit or use [] if there are no prerequisites. "
+        "Use only valid step numbers in the current plan. Do NOT create cycles.\n"
         "4. Maximum 5 steps.\n"
         "5. Do NOT invent tools or parameters that are not in the schemas.\n"
         "6. If the request cannot be fulfilled, return []."
@@ -757,10 +760,78 @@ class CompanionAI:
                     )
                 seen_steps.append(step_sig)
 
+                # Phase 7E: Extract and validate depends_on from model output.
+                # Model-generated step numbers are 1-based and refer to the plan's sequential position.
+                if "depends_on" in step:
+                    raw_deps = step["depends_on"]
+                else:
+                    raw_deps = []
+                if not isinstance(raw_deps, list):
+                    return create_task(
+                        user_request=user_request,
+                        steps_data=[],
+                        task_id=tid,
+                        status=TaskStatus.FAILED,
+                        error=(
+                            f"Plan rejected: Step {idx} ({tool_name_clean}) "
+                            "'depends_on' must be a list."
+                        ),
+                    )
+                validated_deps: List[int] = []
+                plan_length = len(parsed)
+                for dep_raw in raw_deps:
+                    if not isinstance(dep_raw, int) or isinstance(dep_raw, bool):
+                        return create_task(
+                            user_request=user_request,
+                            steps_data=[],
+                            task_id=tid,
+                            status=TaskStatus.FAILED,
+                            error=(
+                                f"Plan rejected: Step {idx} ({tool_name_clean}) "
+                                f"depends_on contains non-integer value {dep_raw!r}."
+                            ),
+                        )
+                    if dep_raw < 1 or dep_raw > plan_length:
+                        return create_task(
+                            user_request=user_request,
+                            steps_data=[],
+                            task_id=tid,
+                            status=TaskStatus.FAILED,
+                            error=(
+                                f"Plan rejected: Step {idx} ({tool_name_clean}) "
+                                f"depends_on references out-of-range step number {dep_raw} "
+                                f"(plan has {plan_length} steps)."
+                            ),
+                        )
+                    if dep_raw == idx:
+                        return create_task(
+                            user_request=user_request,
+                            steps_data=[],
+                            task_id=tid,
+                            status=TaskStatus.FAILED,
+                            error=(
+                                f"Plan rejected: Step {idx} ({tool_name_clean}) "
+                                "declares a self-dependency."
+                            ),
+                        )
+                    if dep_raw in validated_deps:
+                        return create_task(
+                            user_request=user_request,
+                            steps_data=[],
+                            task_id=tid,
+                            status=TaskStatus.FAILED,
+                            error=(
+                                f"Plan rejected: Step {idx} ({tool_name_clean}) "
+                                f"has duplicate dependency reference {dep_raw}."
+                            ),
+                        )
+                    validated_deps.append(dep_raw)
+
                 steps_data.append({
                     "tool_name": tool_name_clean,
                     "args": args,
                     "description": step.get("description", f"Execute {tool_name_clean}"),
+                    "depends_on": validated_deps,
                 })
 
             task = create_task(user_request=user_request, steps_data=steps_data, task_id=tid)

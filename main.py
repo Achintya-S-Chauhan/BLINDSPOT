@@ -313,7 +313,8 @@ def main():
                             for s in task.steps:
                                 args_repr = ", ".join(f"{k}={v!r}" for k, v in s.args.items()) if s.args else "none"
                                 desc_str = f" — {s.description}" if s.description else ""
-                                print(f"  Step {s.step_id}: {s.tool_name}({args_repr}){desc_str}")
+                                deps_str = f" [requires: {s.depends_on}]" if s.depends_on else ""
+                                print(f"  Step {s.step_id}: {s.tool_name}({args_repr}){desc_str}{deps_str}")
 
                             print("\n[EXECUTING TASK]")
                             summary = task_executor.execute(task, pre_validate=True)
