@@ -14,6 +14,7 @@ import uuid
 from typing import Optional, List, Dict, Any, Tuple
 from tools import ToolRegistry, ToolResult
 from verification import StepVerificationResult, VerificationStatus, TaskVerifier
+from recovery import FailureType, RecoveryDecision, RecoveryRecord, RetryPolicy
 
 
 # Maximum allowable steps in a single task to prevent runaway chains
@@ -51,6 +52,9 @@ class TaskStep:
     status: StepStatus = StepStatus.PENDING
     result: Optional[ToolResult] = None
     verification: Optional[StepVerificationResult] = None
+    recovery: Optional[RecoveryRecord] = None
+    attempts: int = 1
+    max_retries: int = 0
     error: Optional[str] = None
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
@@ -65,6 +69,9 @@ class TaskStep:
             "status": self.status.value,
             "result": self.result.to_dict() if self.result else None,
             "verification": self.verification.to_dict() if self.verification else None,
+            "recovery": self.recovery.to_dict() if self.recovery else None,
+            "attempts": self.attempts,
+            "max_retries": self.max_retries,
             "error": self.error,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
@@ -126,6 +133,10 @@ class TaskExecutionSummary:
     executed_steps: int
     successful_steps: int
     failed_step_id: Optional[int] = None
+    failure_type: Optional[str] = None
+    retry_attempts: int = 0
+    skipped_steps: int = 0
+    skipped_step_ids: List[int] = field(default_factory=list)
     error: Optional[str] = None
     duration_seconds: float = 0.0
     step_results: List[Dict[str, Any]] = field(default_factory=list)
@@ -149,6 +160,10 @@ class TaskExecutionSummary:
             "successful_steps": self.successful_steps,
             "verified_steps": self.verified_steps,
             "failed_step_id": self.failed_step_id,
+            "failure_type": self.failure_type,
+            "retry_attempts": self.retry_attempts,
+            "skipped_steps": self.skipped_steps,
+            "skipped_step_ids": self.skipped_step_ids,
             "error": self.error,
             "duration_seconds": self.duration_seconds,
             "step_results": self.step_results,
@@ -249,6 +264,7 @@ class TaskExecutor:
         max_steps: int = MAX_TASK_STEPS,
         pre_validate: bool = False,
         verifier: Optional[Any] = None,
+        retry_policy: Optional[Any] = None,
     ):
         self.tool_registry = tool_registry
         self.max_steps = max_steps
@@ -259,6 +275,14 @@ class TaskExecutor:
             self.verifier = None
         else:
             self.verifier = verifier
+
+        if retry_policy is None:
+            self.retry_policy: RetryPolicy = RetryPolicy()
+        elif retry_policy is False:
+            self.retry_policy = RetryPolicy(enabled=False, max_retries=0)
+        else:
+            self.retry_policy = retry_policy
+
         self._lock = threading.Lock()
 
     def execute(self, task: Task, pre_validate: Optional[bool] = None) -> TaskExecutionSummary:
@@ -282,6 +306,11 @@ class TaskExecutor:
                     total_steps=len(task.steps),
                     executed_steps=0,
                     successful_steps=0,
+                    failed_step_id=task.steps[0].step_id if task.steps else None,
+                    failure_type=FailureType.VALIDATION_ERROR.value,
+                    retry_attempts=0,
+                    skipped_steps=len(task.steps),
+                    skipped_step_ids=[s.step_id for s in task.steps],
                     error=task.error or "Task failed prior to execution",
                     duration_seconds=0.0,
                 )
@@ -298,6 +327,11 @@ class TaskExecutor:
                     total_steps=len(task.steps),
                     executed_steps=0,
                     successful_steps=0,
+                    failed_step_id=task.steps[0].step_id if task.steps else None,
+                    failure_type=FailureType.VALIDATION_ERROR.value,
+                    retry_attempts=0,
+                    skipped_steps=len(task.steps),
+                    skipped_step_ids=[s.step_id for s in task.steps],
                     error=task.error,
                     duration_seconds=0.0,
                 )
@@ -317,6 +351,11 @@ class TaskExecutor:
                         total_steps=len(task.steps),
                         executed_steps=0,
                         successful_steps=0,
+                        failed_step_id=task.steps[0].step_id if task.steps else None,
+                        failure_type=FailureType.VALIDATION_ERROR.value,
+                        retry_attempts=0,
+                        skipped_steps=len(task.steps),
+                        skipped_step_ids=[s.step_id for s in task.steps],
                         error=task.error,
                         duration_seconds=task.completed_at - now,
                     )
@@ -336,7 +375,9 @@ class TaskExecutor:
 
             executed_count = 0
             successful_count = 0
+            total_retries = 0
             failed_step_id: Optional[int] = None
+            task_failure_type: Optional[str] = None
             step_results: List[Dict[str, Any]] = []
 
             for step in task.steps:
@@ -351,61 +392,142 @@ class TaskExecutor:
                     step.status = StepStatus.FAILED
                     step.error = err_msg
                     step.completed_at = time.time()
+                    step.attempts = 1
+                    step.recovery = RecoveryRecord(
+                        failure_type=FailureType.VALIDATION_ERROR,
+                        decision=RecoveryDecision.ABORT,
+                        attempt=1,
+                        max_retries=0,
+                        error=err_msg,
+                        retryable=False,
+                        message="Unregistered tool cannot be executed or retried.",
+                    )
                     task.status = TaskStatus.FAILED
                     task.error = f"Step {step.step_id} failed: {err_msg}"
                     failed_step_id = step.step_id
+                    task_failure_type = FailureType.VALIDATION_ERROR.value
                     step_results.append(step.to_dict())
                     break
 
-                # Execute tool strictly through ToolRegistry
-                res: ToolResult = self.tool_registry.execute(step.tool_name, **step.args)
-                step.result = res
-                step.completed_at = time.time()
+                is_retryable = self.retry_policy.is_safe_to_retry(step.tool_name, tool=tool)
+                max_retries = self.retry_policy.max_retries if is_retryable else 0
+                step.max_retries = max_retries
 
-                if res.success:
-                    # Verification Gate: verify step if verifier is configured
-                    if self.verifier:
-                        v_res = self.verifier.verify_step(step, tool=tool)
-                        step.verification = v_res
-                        if v_res.status == VerificationStatus.FAILED:
-                            step.status = StepStatus.FAILED
-                            step.error = f"Verification failed: {v_res.message}"
-                            task.status = TaskStatus.FAILED
-                            task.error = f"Step {step.step_id} ({step.tool_name}) verification failed: {v_res.message}"
+                attempt = 0
+                step_success = False
+
+                while True:
+                    attempt += 1
+                    step.attempts = attempt
+
+                    # Execute tool strictly through ToolRegistry
+                    res: ToolResult = self.tool_registry.execute(step.tool_name, **step.args)
+                    step.result = res
+                    step.completed_at = time.time()
+
+                    if not res.success:
+                        # Distinguish permission denial / safety block from general execution errors
+                        is_blocked = (
+                            res.metadata.get("denied_by") is not None
+                            or res.metadata.get("blocked_by") is not None
+                            or "permission denied" in (res.error or "").lower()
+                            or "safety policy" in (res.error or "").lower()
+                            or "safety boundary" in (res.error or "").lower()
+                        )
+                        if is_blocked:
+                            step.status = StepStatus.BLOCKED
+                            task.status = TaskStatus.BLOCKED
+                            step.error = res.error
+                            task.error = f"Step {step.step_id} ({step.tool_name}) stopped: {res.error}"
                             failed_step_id = step.step_id
+                            task_failure_type = FailureType.PERMISSION_DENIED.value
+                            step.recovery = RecoveryRecord(
+                                failure_type=FailureType.PERMISSION_DENIED,
+                                decision=RecoveryDecision.ABORT,
+                                attempt=attempt,
+                                max_retries=max_retries,
+                                error=res.error,
+                                retryable=False,
+                                message="Action blocked by permission policy or safety boundary; retries prohibited.",
+                            )
                             step_results.append(step.to_dict())
-                            # HALT IMMEDIATELY on verification failure
                             break
-
-                    step.status = StepStatus.COMPLETED
-                    successful_count += 1
-                    step_results.append(step.to_dict())
-                else:
-                    # Distinguish permission denial / safety block from general execution errors
-                    is_blocked = (
-                        res.metadata.get("denied_by") is not None
-                        or res.metadata.get("blocked_by") is not None
-                        or "permission denied" in (res.error or "").lower()
-                        or "safety policy" in (res.error or "").lower()
-                        or "safety boundary" in (res.error or "").lower()
-                    )
-                    if is_blocked:
-                        step.status = StepStatus.BLOCKED
-                        task.status = TaskStatus.BLOCKED
+                        else:
+                            # Tool execution failure - evaluate retry policy
+                            decision, rec = self.retry_policy.evaluate(
+                                tool_name=step.tool_name,
+                                attempt=attempt,
+                                failure_type=FailureType.EXECUTION_ERROR,
+                                error=res.error or "",
+                                tool=tool,
+                            )
+                            step.recovery = rec
+                            if decision == RecoveryDecision.RETRY:
+                                total_retries += 1
+                                continue
+                            else:
+                                step.status = StepStatus.FAILED
+                                task.status = TaskStatus.FAILED
+                                step.error = res.error
+                                task.error = f"Step {step.step_id} ({step.tool_name}) stopped: {res.error}"
+                                failed_step_id = step.step_id
+                                task_failure_type = rec.failure_type.value
+                                step_results.append(step.to_dict())
+                                break
                     else:
-                        step.status = StepStatus.FAILED
-                        task.status = TaskStatus.FAILED
+                        # Verification Gate: verify step if verifier is configured
+                        if self.verifier:
+                            v_res = self.verifier.verify_step(step, tool=tool)
+                            step.verification = v_res
+                            if v_res.status == VerificationStatus.FAILED:
+                                decision, rec = self.retry_policy.evaluate(
+                                    tool_name=step.tool_name,
+                                    attempt=attempt,
+                                    failure_type=FailureType.VERIFICATION_FAILURE,
+                                    error=v_res.message or "",
+                                    tool=tool,
+                                )
+                                step.recovery = rec
+                                if decision == RecoveryDecision.RETRY:
+                                    total_retries += 1
+                                    continue
+                                else:
+                                    step.status = StepStatus.FAILED
+                                    task.status = TaskStatus.FAILED
+                                    step.error = f"Verification failed: {v_res.message}"
+                                    task.error = f"Step {step.step_id} ({step.tool_name}) verification failed: {v_res.message}"
+                                    failed_step_id = step.step_id
+                                    task_failure_type = rec.failure_type.value
+                                    step_results.append(step.to_dict())
+                                    break
 
-                    step.error = res.error
-                    task.error = f"Step {step.step_id} ({step.tool_name}) stopped: {res.error}"
-                    failed_step_id = step.step_id
-                    step_results.append(step.to_dict())
-                    # STOP IMMEDIATELY on failure or block
+                        # Step successfully completed and verified
+                        step.status = StepStatus.COMPLETED
+                        successful_count += 1
+                        step_success = True
+                        step.recovery = RecoveryRecord(
+                            failure_type=FailureType.NONE,
+                            decision=RecoveryDecision.NONE,
+                            attempt=attempt,
+                            max_retries=max_retries,
+                            error=None,
+                            retryable=False,
+                            message="Step completed successfully.",
+                        )
+                        step_results.append(step.to_dict())
+                        break
+
+                if not step_success:
+                    # Halt task execution immediately; subsequent steps remain PENDING
                     break
 
             task.completed_at = time.time()
             if task.status == TaskStatus.RUNNING:
                 task.status = TaskStatus.COMPLETED
+
+            skipped_steps_list = [s for s in task.steps if s.status == StepStatus.PENDING]
+            skipped_count = len(skipped_steps_list)
+            skipped_ids = [s.step_id for s in skipped_steps_list]
 
             return TaskExecutionSummary(
                 task_id=task.task_id,
@@ -415,6 +537,10 @@ class TaskExecutor:
                 executed_steps=executed_count,
                 successful_steps=successful_count,
                 failed_step_id=failed_step_id,
+                failure_type=task_failure_type,
+                retry_attempts=total_retries,
+                skipped_steps=skipped_count,
+                skipped_step_ids=skipped_ids,
                 error=task.error,
                 duration_seconds=task.completed_at - now,
                 step_results=step_results,

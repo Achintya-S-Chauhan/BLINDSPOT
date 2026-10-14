@@ -318,14 +318,17 @@ def main():
                             print("\n[EXECUTING TASK]")
                             summary = task_executor.execute(task, pre_validate=True)
                             print(f"\n[TASK RESULT]: {summary.status.value.upper()}")
+                            retry_str = f", {summary.retry_attempts} retries" if summary.retry_attempts > 0 else ""
                             print(
                                 f"Progress: {summary.successful_steps}/{summary.total_steps} executed successfully "
-                                f"({summary.verified_steps} verified) in {summary.duration_seconds:.2f}s"
+                                f"({summary.verified_steps} verified{retry_str}) in {summary.duration_seconds:.2f}s"
                             )
                             for sr in summary.step_results:
                                 v = sr.get("verification") or {}
                                 v_status = v.get("status")
                                 v_msg = v.get("message")
+                                attempts = sr.get("attempts", 1)
+                                attempt_str = f" [attempts: {attempts}]" if attempts > 1 else ""
 
                                 if sr["status"] == "completed":
                                     if v_status == "verified":
@@ -342,7 +345,7 @@ def main():
                                     else:
                                         sym = "[FAILED: EXECUTION]"
 
-                                print(f"  {sym} Step {sr['step_id']}: {sr['tool_name']}")
+                                print(f"  {sym} Step {sr['step_id']}: {sr['tool_name']}{attempt_str}")
                                 if sr.get("output"):
                                     out_preview = str(sr["output"]).strip()
                                     if "\n" in out_preview:
@@ -353,11 +356,18 @@ def main():
                                 if v_status:
                                     v_label = v_status.upper().replace("_", " ")
                                     print(f"       Verification: [{v_label}] {v_msg or ''}")
+                                if sr.get("recovery") and sr["recovery"].get("message") and sr["recovery"].get("decision") != "none":
+                                    print(f"       Recovery:     {sr['recovery']['message']}")
                                 if sr.get("error"):
                                     print(f"       Error:        {sr['error']}")
 
-                            if summary.status != TaskStatus.COMPLETED and summary.error:
-                                print(f"\nTask halted: {summary.error}")
+                            if summary.status != TaskStatus.COMPLETED:
+                                print(f"\nTask halted: {summary.error or 'Execution stopped'}")
+                                if summary.failure_type:
+                                    print(f"Failure classification: {summary.failure_type.upper()}")
+                                if summary.skipped_steps > 0:
+                                    steps_str = ", ".join(f"Step {sid}" for sid in summary.skipped_step_ids)
+                                    print(f"Skipped steps: {summary.skipped_steps} ({steps_str})")
 
             elif cmd.startswith("ask"):
                 question = raw_input_line[3:].strip()
