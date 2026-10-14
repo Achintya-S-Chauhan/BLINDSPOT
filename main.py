@@ -19,6 +19,7 @@ from tools import (
 )
 from desktop_io import MockDesktopIO
 from task import TaskExecutor, TaskStatus, validate_task
+from verification import TaskVerifier, DefaultContextObserver
 
 STABILITY_TIME = 1.5        # Time window must remain active before first OCR
 OCR_INTERVAL = 3.0          # Interval between periodic OCR scans in the same active window
@@ -246,7 +247,8 @@ def main():
     analyzer = ContextualUnderstandingAnalyzer()
     assistant = CompanionAssistant()
     companion_ai = CompanionAI(conversation=conversation, tool_registry=tool_registry)
-    task_executor = TaskExecutor(tool_registry=tool_registry)
+    verifier = TaskVerifier(observer=DefaultContextObserver(state=state))
+    task_executor = TaskExecutor(tool_registry=tool_registry, verifier=verifier)
 
     # start monitor in background
     threading.Thread(target=monitor, args=(state, state_lock), daemon=True).start()
@@ -316,14 +318,30 @@ def main():
                             print("\n[EXECUTING TASK]")
                             summary = task_executor.execute(task, pre_validate=True)
                             print(f"\n[TASK RESULT]: {summary.status.value.upper()}")
-                            print(f"Progress: {summary.successful_steps}/{summary.total_steps} completed ({summary.executed_steps} executed) in {summary.duration_seconds:.2f}s")
+                            print(
+                                f"Progress: {summary.successful_steps}/{summary.total_steps} executed successfully "
+                                f"({summary.verified_steps} verified) in {summary.duration_seconds:.2f}s"
+                            )
                             for sr in summary.step_results:
+                                v = sr.get("verification") or {}
+                                v_status = v.get("status")
+                                v_msg = v.get("message")
+
                                 if sr["status"] == "completed":
-                                    sym = "[OK]"
+                                    if v_status == "verified":
+                                        sym = "[OK: VERIFIED]"
+                                    elif v_status == "not_verifiable":
+                                        sym = "[OK: UNVERIFIED]"
+                                    else:
+                                        sym = "[OK]"
                                 elif sr["status"] == "blocked":
                                     sym = "[BLOCKED]"
                                 else:
-                                    sym = "[FAILED]"
+                                    if v_status == "failed":
+                                        sym = "[FAILED: VERIFICATION]"
+                                    else:
+                                        sym = "[FAILED: EXECUTION]"
+
                                 print(f"  {sym} Step {sr['step_id']}: {sr['tool_name']}")
                                 if sr.get("output"):
                                     out_preview = str(sr["output"]).strip()
@@ -331,9 +349,12 @@ def main():
                                         out_preview = out_preview.split("\n")[0] + "..."
                                     if len(out_preview) > 80:
                                         out_preview = out_preview[:77] + "..."
-                                    print(f"       Result: {out_preview}")
+                                    print(f"       Result:       {out_preview}")
+                                if v_status:
+                                    v_label = v_status.upper().replace("_", " ")
+                                    print(f"       Verification: [{v_label}] {v_msg or ''}")
                                 if sr.get("error"):
-                                    print(f"       Reason: {sr['error']}")
+                                    print(f"       Error:        {sr['error']}")
 
                             if summary.status != TaskStatus.COMPLETED and summary.error:
                                 print(f"\nTask halted: {summary.error}")

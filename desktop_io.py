@@ -355,9 +355,14 @@ class MockDesktopIO(DesktopIO):
     Inspect `calls` after execution to verify what was invoked.
     """
 
-    def __init__(self, fail_operations: Optional[List[str]] = None):
+    def __init__(
+        self,
+        fail_operations: Optional[List[str]] = None,
+        initial_active_window: Optional[str] = None,
+    ):
         self.calls: List[MockCall] = []
         self._fail_ops: set = set(fail_operations or [])
+        self.active_window: Optional[str] = initial_active_window
 
     def _record(self, method: str, *args, **kwargs) -> DesktopIOResult:
         self.calls.append(MockCall(method=method, args=args, kwargs=kwargs))
@@ -376,10 +381,16 @@ class MockDesktopIO(DesktopIO):
         )
 
     def open_application(self, app_name: str) -> DesktopIOResult:
-        return self._record("open_application", app_name)
+        res = self._record("open_application", app_name)
+        if res.success:
+            self.active_window = app_name
+        return res
 
     def focus_application(self, window_title_fragment: str) -> DesktopIOResult:
-        return self._record("focus_application", window_title_fragment)
+        res = self._record("focus_application", window_title_fragment)
+        if res.success:
+            self.active_window = window_title_fragment
+        return res
 
     def move_mouse(self, x: int, y: int, duration: float = 0.2) -> DesktopIOResult:
         return self._record("move_mouse", x, y, duration=duration)
@@ -405,6 +416,7 @@ class MockDesktopIO(DesktopIO):
     def reset(self) -> None:
         """Clear recorded calls (useful between test cases)."""
         self.calls.clear()
+        self.active_window = None
 
     @property
     def call_count(self) -> int:
