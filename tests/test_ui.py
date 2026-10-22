@@ -16,8 +16,11 @@ from unittest.mock import MagicMock, patch
 
 from ui import UIStateBridge, BlindspotMainWindow
 from main import initialize_system, monitor
-from task import Task, TaskStep, TaskStatus
-from tools import ToolRegistry, BaseTool, ToolResult, ActionRisk
+from task import Task, TaskStep, TaskStatus, StepStatus, TaskExecutor, FailureType
+from tools import ToolRegistry, BaseTool, ToolResult, ActionRisk, ActionRequest, PermissionPolicy, _auto_deny
+from verification import TaskVerifier, DesktopObserver, StepVerificationResult, VerificationStatus
+from recovery import RetryPolicy, RecoveryRecord, RecoveryDecision
+from context import DesktopContext
 
 
 class MockTestTool(BaseTool):
@@ -397,6 +400,430 @@ class TestPlanningRejectionRegression(unittest.TestCase):
                 root.destroy()
             except Exception:
                 pass
+
+
+class MockFailingVerifier:
+    """Verifier mock that always fails verification for testing."""
+    def verify_step(self, step, tool=None):
+        return StepVerificationResult(
+            status=VerificationStatus.FAILED,
+            message="Simulated verification mismatch: expected target window not found.",
+            details={"observed": "WrongWindow"},
+        )
+
+
+class MockVerifyingVerifier:
+    """Verifier mock that verifies specific tools."""
+    def verify_step(self, step, tool=None):
+        if step.tool_name in ("open_application", "focus_application", "mock_action"):
+            return StepVerificationResult(
+                status=VerificationStatus.VERIFIED,
+                message=f"Action '{step.tool_name}' verified active on desktop.",
+                details={"observed": "VerifiedDesktop"},
+            )
+        return StepVerificationResult(
+            status=VerificationStatus.NOT_VERIFIABLE,
+            message=f"Action '{step.tool_name}' does not support desktop verification.",
+        )
+
+
+class TestPhase8BControlledExecution(unittest.TestCase):
+    """Integration and safety tests for Phase 8B Controlled Desktop Execution."""
+
+    def setUp(self):
+        self.state = {
+            "last_window": "VSCode",
+            "last_context": "coding",
+            "last_confidence": 3,
+            "is_running": True,
+        }
+        self.lock = threading.Lock()
+        self.registry = ToolRegistry(allow_actions=True)
+        self.registry.register(MockTestTool("mock_tool_a", risk=ActionRisk.READ_ONLY))
+        self.registry.register(MockTestTool("mock_tool_b", risk=ActionRisk.READ_ONLY))
+        self.registry.register(MockTestTool("mock_action", risk=ActionRisk.LOW_RISK_ACTION))
+
+        self.verifier = MockVerifyingVerifier()
+        self.retry_policy = RetryPolicy(max_retries=2)
+        self.executor = TaskExecutor(
+            tool_registry=self.registry,
+            verifier=self.verifier,
+            retry_policy=self.retry_policy,
+        )
+        self.mock_ai = DummyCompanionAI()
+        self.bridge = UIStateBridge(
+            state=self.state,
+            state_lock=self.lock,
+            companion_ai=self.mock_ai,
+            tool_registry=self.registry,
+            task_executor=self.executor,
+        )
+
+    def test_25_plan_approval_and_invalidation(self):
+        """Plan must be explicitly approved, and can be invalidated cleanly."""
+        res = self.bridge.plan_task("Sample task")
+        self.assertTrue(res["success"])
+        self.assertIsNotNone(self.bridge.pending_task)
+        self.assertFalse(self.bridge.is_plan_approved)
+
+        # Approve plan
+        app_res = self.bridge.approve_plan()
+        self.assertTrue(app_res["success"])
+        self.assertTrue(self.bridge.is_plan_approved)
+
+        # Invalidate plan
+        self.bridge.invalidate_plan()
+        self.assertIsNone(self.bridge.pending_task)
+        self.assertFalse(self.bridge.is_plan_approved)
+
+        # Approving when no plan exists fails gracefully
+        fail_app = self.bridge.approve_plan()
+        self.assertFalse(fail_app["success"])
+        self.assertIn("No valid plan available", fail_app["error"])
+
+    def test_26_execution_requires_explicit_plan_approval(self):
+        """Task execution must be refused unless plan has explicit user approval."""
+        res = self.bridge.plan_task("Sample task")
+        self.assertTrue(res["success"])
+        self.assertFalse(self.bridge.is_plan_approved)
+
+        # Attempt to execute unapproved plan
+        exec_res = self.bridge.execute_approved_task()
+        self.assertFalse(exec_res["success"])
+        self.assertIn("Plan has not been approved", exec_res["error"])
+
+        # Approve and then execute
+        self.bridge.approve_plan()
+        self.assertTrue(self.bridge.is_plan_approved)
+        exec_ok = self.bridge.execute_approved_task()
+        self.assertTrue(exec_ok["success"])
+        self.assertEqual(exec_ok["status"], "completed")
+        self.assertEqual(exec_ok["executed_steps"], 2)
+
+    def test_27_plan_modification_invalidates_approval_in_ui(self):
+        """Editing task request input in the UI invalidates existing approval."""
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = BlindspotMainWindow(root=root, bridge=self.bridge)
+            app.task_entry.insert(0, "Inspect desktop")
+
+            # Plan task
+            res = self.bridge.plan_task("Inspect desktop")
+            app._handle_plan_result(res)
+            self.assertEqual(str(app.approve_btn.cget("state")), "normal")
+            self.assertEqual(str(app.execute_btn.cget("state")), "disabled")
+
+            # Approve plan
+            app._on_approve_clicked()
+            self.assertEqual(str(app.approve_btn.cget("state")), "disabled")
+            self.assertEqual(str(app.execute_btn.cget("state")), "normal")
+            self.assertTrue(self.bridge.is_plan_approved)
+
+            # Modify input text
+            app.task_entry.insert(tk.END, " extra text")
+            app._on_input_changed()
+
+            # Must invalidate approval immediately
+            self.assertFalse(self.bridge.is_plan_approved)
+            self.assertIsNone(self.bridge.pending_task)
+            self.assertEqual(str(app.approve_btn.cget("state")), "disabled")
+            self.assertEqual(str(app.execute_btn.cget("state")), "disabled")
+            self.assertIn("invalidated", app.footer_label.cget("text"))
+
+            app.on_close()
+        finally:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+    def test_28_controlled_execution_success_with_task_executor(self):
+        """Approved task executes through TaskExecutor with step verifications recorded."""
+        self.bridge.plan_task("Test task execution")
+        self.bridge.approve_plan()
+
+        res = self.bridge.execute_approved_task()
+        self.assertTrue(res["success"])
+        self.assertEqual(res["status"], "completed")
+        self.assertEqual(res["total_steps"], 2)
+        self.assertEqual(res["executed_steps"], 2)
+        self.assertEqual(res["successful_steps"], 2)
+        self.assertGreaterEqual(len(res["steps"]), 2)
+
+        # Plan must be consumed (cannot re-execute without formulating a new plan)
+        self.assertIsNone(self.bridge.pending_task)
+        self.assertFalse(self.bridge.is_plan_approved)
+
+    def test_29_permission_policy_denial_halts_and_blocks_task(self):
+        """Action tool denied by permission policy halts execution in BLOCKED state."""
+        # Custom task with a low-risk action step and a dependent step
+        action_task = Task(user_request="run action", task_id="t_action")
+        action_task.steps = [
+            TaskStep(step_id=1, tool_name="mock_action", args={}, description="Step 1", depends_on=[]),
+            TaskStep(step_id=2, tool_name="mock_tool_b", args={}, description="Step 2", depends_on=[1]),
+        ]
+        ai = DummyCompanionAI(plan_return=action_task)
+        bridge = UIStateBridge(
+            state=self.state,
+            state_lock=self.lock,
+            companion_ai=ai,
+            tool_registry=self.registry,
+            task_executor=self.executor,
+            action_approver=lambda req: False,  # Deny permission
+        )
+
+        plan_res = bridge.plan_task("run action")
+        self.assertTrue(plan_res["success"])
+        bridge.approve_plan()
+
+        exec_res = bridge.execute_approved_task()
+        self.assertFalse(exec_res["success"])
+        self.assertEqual(exec_res["status"], "blocked")
+        self.assertEqual(exec_res["failure_type"], "permission_denied")
+        self.assertEqual(exec_res["executed_steps"], 1)
+        self.assertEqual(exec_res["skipped_steps"], 1)
+        self.assertEqual(exec_res["steps"][0]["status"], "blocked")
+
+    def test_30_permission_policy_approval_proceeds_and_verifies(self):
+        """Action tool approved by permission policy executes and records verification."""
+        action_task = Task(user_request="run approved action", task_id="t_action_ok")
+        action_task.steps = [
+            TaskStep(step_id=1, tool_name="mock_action", args={}, description="Step 1", depends_on=[]),
+        ]
+        ai = DummyCompanionAI(plan_return=action_task)
+        bridge = UIStateBridge(
+            state=self.state,
+            state_lock=self.lock,
+            companion_ai=ai,
+            tool_registry=self.registry,
+            task_executor=self.executor,
+            action_approver=lambda req: True,  # Grant permission
+        )
+
+        bridge.plan_task("run approved action")
+        bridge.approve_plan()
+
+        exec_res = bridge.execute_approved_task()
+        self.assertTrue(exec_res["success"])
+        self.assertEqual(exec_res["status"], "completed")
+        self.assertEqual(exec_res["steps"][0]["verification"]["status"], "verified")
+        self.assertIn("verified active on desktop", exec_res["steps"][0]["verification"]["message"])
+
+    def test_31_duplicate_and_simultaneous_execution_prevention(self):
+        """Simultaneous planning or duplicate executions are rejected."""
+        self.bridge.plan_task("Task 1")
+        self.bridge.approve_plan()
+
+        # Simulate execution in progress
+        self.bridge.is_executing = True
+
+        # Attempt duplicate execution
+        dup_res = self.bridge.execute_approved_task()
+        self.assertFalse(dup_res["success"])
+        self.assertIn("already in progress", dup_res["error"])
+
+        # Attempt planning during execution
+        plan_res = self.bridge.plan_task("Task 2")
+        self.assertFalse(plan_res["success"])
+        self.assertIn("currently in progress", plan_res["error"])
+
+        # Attempt approval during execution
+        app_res = self.bridge.approve_plan()
+        self.assertFalse(app_res["success"])
+        self.assertIn("while execution is in progress", app_res["error"])
+
+        self.bridge.is_executing = False
+
+    def test_32_verification_failure_displayed_accurately(self):
+        """Verification failure halts task, records failure_type, and is formatted in UI."""
+        failing_executor = TaskExecutor(
+            tool_registry=self.registry,
+            verifier=MockFailingVerifier(),
+            retry_policy=RetryPolicy(enabled=False, max_retries=0),
+        )
+        bridge = UIStateBridge(
+            state=self.state,
+            state_lock=self.lock,
+            companion_ai=self.mock_ai,
+            tool_registry=self.registry,
+            task_executor=failing_executor,
+        )
+
+        bridge.plan_task("Fail verify task")
+        bridge.approve_plan()
+
+        res = bridge.execute_approved_task()
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "failed")
+        self.assertEqual(res["failure_type"], "verification_failure")
+
+        # Test UI rendering of verification failure
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = BlindspotMainWindow(root=root, bridge=bridge)
+            app._handle_execution_result(res)
+            out = app.plan_output.get("1.0", tk.END)
+            self.assertIn("[TASK EXECUTION FAILED — POST-EXECUTION VERIFICATION FAILED]", out)
+            self.assertIn("Verification: [FAILED]", out)
+            self.assertNotIn("ALL STEPS VERIFIED", out)
+            app.on_close()
+        finally:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+    def test_33_retry_and_recovery_displayed_in_ui(self):
+        """Transient step failure that recovers on retry is reflected in UI."""
+        call_count = [0]
+
+        class FlakyTool(BaseTool):
+            def __init__(self):
+                super().__init__(name="flaky_tool", description="Flaky test tool", risk=ActionRisk.READ_ONLY)
+            def execute(self, **kwargs):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    return ToolResult(tool_name=self.name, success=False, error="Transient error")
+                return ToolResult(tool_name=self.name, success=True, output="Recovered")
+
+        reg = ToolRegistry(allow_actions=True)
+        reg.register(FlakyTool())
+        flaky_task = Task(user_request="run flaky", task_id="t_flaky")
+        flaky_task.steps = [TaskStep(step_id=1, tool_name="flaky_tool", args={}, description="Step 1")]
+        ai = DummyCompanionAI(plan_return=flaky_task)
+
+        executor = TaskExecutor(
+            tool_registry=reg,
+            verifier=False,
+            retry_policy=RetryPolicy(safe_tools={"flaky_tool"}, max_retries=2),
+        )
+        bridge = UIStateBridge(
+            state=self.state,
+            state_lock=self.lock,
+            companion_ai=ai,
+            tool_registry=reg,
+            task_executor=executor,
+        )
+        bridge.plan_task("run flaky")
+        bridge.approve_plan()
+
+        res = bridge.execute_approved_task()
+        self.assertTrue(res["success"])
+        self.assertEqual(res["status"], "completed")
+        self.assertEqual(res["retry_attempts"], 1)
+        self.assertEqual(res["steps"][0]["attempts"], 2)
+
+        # Check UI output
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = BlindspotMainWindow(root=root, bridge=bridge)
+            app._handle_execution_result(res)
+            out = app.plan_output.get("1.0", tk.END)
+            self.assertIn("Attempts: 2", out)
+            self.assertIn("1 retried", out)
+            app.on_close()
+        finally:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+    def test_34_ui_cannot_bypass_execution_pipeline(self):
+        """UI planning does not execute tools, and execution only runs through TaskExecutor."""
+        mock_tool_exec = MagicMock()
+        tool = MockTestTool("mock_tool_tracked")
+        tool.execute = mock_tool_exec
+        reg = ToolRegistry(allow_actions=True)
+        reg.register(tool)
+
+        task = Task(user_request="test tracked", task_id="t_tracked")
+        task.steps = [TaskStep(step_id=1, tool_name="mock_tool_tracked", args={}, description="Step 1")]
+        ai = DummyCompanionAI(plan_return=task)
+
+        bridge = UIStateBridge(
+            state=self.state,
+            state_lock=self.lock,
+            companion_ai=ai,
+            tool_registry=reg,
+            task_executor=TaskExecutor(tool_registry=reg, verifier=False),
+        )
+
+        # 1. Planning phase must NEVER execute tools
+        bridge.plan_task("test tracked")
+        mock_tool_exec.assert_not_called()
+
+        # 2. Approving plan must NEVER execute tools
+        bridge.approve_plan()
+        mock_tool_exec.assert_not_called()
+
+        # 3. Only execute_approved_task executes tools
+        mock_tool_exec.return_value = ToolResult(tool_name="mock_tool_tracked", success=True)
+        bridge.execute_approved_task()
+        mock_tool_exec.assert_called_once()
+
+    def test_35_window_close_unblocks_pending_approval(self):
+        """Closing the window while an approval is pending unblocks thread safely."""
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = BlindspotMainWindow(root=root, bridge=self.bridge)
+            req = ActionRequest(
+                tool_name="mock_action",
+                risk=ActionRisk.LOW_RISK_ACTION,
+                description="Test action request",
+            )
+
+            # Start worker thread requesting approval
+            approval_result = [None]
+            def _request_worker():
+                approval_result[0] = app._ui_action_approver(req)
+
+            t = threading.Thread(target=_request_worker, daemon=True)
+            t.start()
+            time.sleep(0.1)
+
+            # Close window
+            app.on_close()
+            t.join(timeout=1.0)
+            self.assertFalse(t.is_alive())
+            self.assertFalse(approval_result[0])
+        finally:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+
+    def test_36_approver_exception_fails_closed_in_execution(self):
+        """If an action approver raises an unhandled exception, it must fail closed and block the task."""
+        def faulty_approver(request):
+            raise RuntimeError("Unexpected approver crash")
+
+        action_task = Task(user_request="run faulty action", task_id="t_faulty")
+        action_task.steps = [
+            TaskStep(step_id=1, tool_name="mock_action", args={}, description="Step 1"),
+        ]
+        ai = DummyCompanionAI(plan_return=action_task)
+        bridge = UIStateBridge(
+            state=self.state,
+            state_lock=self.lock,
+            companion_ai=ai,
+            tool_registry=self.registry,
+            task_executor=self.executor,
+            action_approver=faulty_approver,
+        )
+
+        bridge.plan_task("run faulty action")
+        bridge.approve_plan()
+
+        res = bridge.execute_approved_task()
+        self.assertFalse(res["success"])
+        self.assertEqual(res["status"], "blocked")
+        self.assertEqual(res["failure_type"], "permission_denied")
+        self.assertEqual(res["steps"][0]["status"], "blocked")
 
 
 if __name__ == "__main__":

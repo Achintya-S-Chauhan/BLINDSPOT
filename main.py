@@ -275,7 +275,8 @@ def main():
         except (EOFError, KeyboardInterrupt):
             return False
 
-    components = initialize_system(low_risk_approver=_cli_approver)
+    is_ui_mode = "--ui" in sys.argv
+    components = initialize_system(low_risk_approver=None if is_ui_mode else _cli_approver)
     state = components["state"]
     state_lock = components["state_lock"]
     analyzer = components["analyzer"]

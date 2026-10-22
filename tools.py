@@ -132,7 +132,10 @@ class PermissionPolicy:
         if request.risk == ActionRisk.HIGH_RISK_ACTION:
             return False  # Structural safety: high-risk is always blocked
         approver = self._approvers.get(request.risk, _auto_deny)
-        return approver(request)
+        try:
+            return bool(approver(request))
+        except Exception:
+            return False
 
     def set_approver(self, risk: ActionRisk, callback: ApprovalCallback) -> None:
         """Replace the approver for the given risk level (used for testing / GUI injection)."""
