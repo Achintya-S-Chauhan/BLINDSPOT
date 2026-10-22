@@ -676,12 +676,18 @@ class CompanionAI:
                 )
 
             if len(parsed) == 0:
+                unallowed_err = self._detect_unallowed_app_request(user_request)
+                err_msg = (
+                    f"Plan rejected: {unallowed_err}"
+                    if unallowed_err
+                    else "Plan rejected: The requested task cannot be fulfilled by any registered tool."
+                )
                 return create_task(
                     user_request=user_request,
                     steps_data=[],
                     task_id=tid,
                     status=TaskStatus.FAILED,
-                    error="Plan rejected: Model returned an empty plan.",
+                    error=err_msg,
                 )
 
             if len(parsed) > MAX_TASK_STEPS:
@@ -851,13 +857,39 @@ class CompanionAI:
                 return task
 
         # 4. If neither worked, return a failed task cleanly
+        if plan_err and "valid json" in plan_err.lower():
+            rejection_error = plan_err
+        else:
+            unallowed_err = self._detect_unallowed_app_request(user_request)
+            if unallowed_err:
+                rejection_error = f"Plan rejected: {unallowed_err}"
+            elif plan_err:
+                rejection_error = plan_err
+            else:
+                rejection_error = "Plan rejected: The requested task cannot be fulfilled by any registered tool."
+
         return create_task(
             user_request=user_request,
             steps_data=[],
             task_id=tid,
             status=TaskStatus.FAILED,
-            error=plan_err or "Could not plan task from user request.",
+            error=rejection_error,
         )
+
+    def _detect_unallowed_app_request(self, user_request: str) -> Optional[str]:
+        """Check if user request is trying to open an unallowed application."""
+        from tools import ALLOWED_APPLICATIONS
+        req_clean = user_request.lower().strip()
+        for prefix in ("open ", "launch ", "start "):
+            if req_clean.startswith(prefix):
+                remainder = req_clean[len(prefix):].strip()
+                app_candidate = remainder.split()[0] if remainder else ""
+                if app_candidate and app_candidate not in ALLOWED_APPLICATIONS:
+                    return (
+                        f"Application '{app_candidate}' is not in the allowed applications list. "
+                        f"Allowed applications: {', '.join(ALLOWED_APPLICATIONS)}."
+                    )
+        return None
 
     def _extract_steps_json(self, text: Any) -> Optional[List[Dict[str, Any]]]:
         """

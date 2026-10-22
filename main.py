@@ -1,3 +1,4 @@
+import sys
 import time
 import threading
 from eyes.window import get_active_window, get_active_window_rect
@@ -72,9 +73,17 @@ def get_summary_times(state, now):
 
 
 # ---------------- MONITOR THREAD ----------------
-def monitor(state, lock):
+def monitor(state, lock, stop_event=None):
     while True:
+        if stop_event is not None and stop_event.is_set():
+            break
         try:
+            with lock:
+                is_running = state.get("is_running", True)
+            if not is_running:
+                time.sleep(POLL_INTERVAL)
+                continue
+
             current_window = get_active_window()
             now = time.time()
 
@@ -188,14 +197,12 @@ def monitor(state, lock):
             time.sleep(POLL_INTERVAL)
 
 
-# ---------------- MAIN ----------------
-def main():
-    print("BLINDSPOT — quiet vision + OCR online\n")
-
+# ---------------- SYSTEM INITIALIZATION ----------------
+def initialize_system(desktop_io=None, allow_actions=True, low_risk_approver=None):
+    """Factory to construct shared state, tool registry, and AI components."""
     conversation = ConversationSession(maxlen=20)
     history = ContextHistory(maxlen=50)
 
-    # shared state
     state = {
         "last_window": None,
         "last_context": None,
@@ -210,12 +217,50 @@ def main():
         "previous_context_obj": None,
         "history": history,
         "conversation": conversation,
+        "is_running": True,
     }
 
-    # Use MockDesktopIO so action tools are registered and visible to Gemini,
-    # but no real hardware is touched without explicit CLI approval.
-    desktop_io = MockDesktopIO()
+    if desktop_io is None:
+        desktop_io = MockDesktopIO()
 
+    permission_policy = PermissionPolicy(low_risk_approver=low_risk_approver)
+
+    tool_registry = create_default_tool_registry(
+        state=state,
+        conversation=conversation,
+        history=history,
+        allow_actions=allow_actions,
+        permission_policy=permission_policy,
+        desktop_io=desktop_io,
+        include_action_tools=True,
+    )
+    state["tool_registry"] = tool_registry
+
+    state_lock = threading.Lock()
+    analyzer = ContextualUnderstandingAnalyzer()
+    assistant = CompanionAssistant()
+    companion_ai = CompanionAI(conversation=conversation, tool_registry=tool_registry)
+    verifier = TaskVerifier(observer=DefaultContextObserver(state=state))
+    task_executor = TaskExecutor(tool_registry=tool_registry, verifier=verifier)
+
+    stop_event = threading.Event()
+    state["stop_event"] = stop_event
+
+    return {
+        "state": state,
+        "state_lock": state_lock,
+        "analyzer": analyzer,
+        "assistant": assistant,
+        "companion_ai": companion_ai,
+        "tool_registry": tool_registry,
+        "task_executor": task_executor,
+        "verifier": verifier,
+        "stop_event": stop_event,
+    }
+
+
+# ---------------- MAIN ----------------
+def main():
     # CLI approval: prompt the user for LOW_RISK_ACTION approval at runtime
     def _cli_approver(request: ActionRequest) -> bool:
         try:
@@ -230,28 +275,35 @@ def main():
         except (EOFError, KeyboardInterrupt):
             return False
 
-    permission_policy = PermissionPolicy(low_risk_approver=_cli_approver)
-
-    tool_registry = create_default_tool_registry(
-        state=state,
-        conversation=conversation,
-        history=history,
-        allow_actions=True,
-        permission_policy=permission_policy,
-        desktop_io=desktop_io,
-        include_action_tools=True,
-    )
-    state["tool_registry"] = tool_registry
-
-    state_lock = threading.Lock()
-    analyzer = ContextualUnderstandingAnalyzer()
-    assistant = CompanionAssistant()
-    companion_ai = CompanionAI(conversation=conversation, tool_registry=tool_registry)
-    verifier = TaskVerifier(observer=DefaultContextObserver(state=state))
-    task_executor = TaskExecutor(tool_registry=tool_registry, verifier=verifier)
+    components = initialize_system(low_risk_approver=_cli_approver)
+    state = components["state"]
+    state_lock = components["state_lock"]
+    analyzer = components["analyzer"]
+    assistant = components["assistant"]
+    companion_ai = components["companion_ai"]
+    tool_registry = components["tool_registry"]
+    task_executor = components["task_executor"]
+    stop_event = components["stop_event"]
 
     # start monitor in background
-    threading.Thread(target=monitor, args=(state, state_lock), daemon=True).start()
+    threading.Thread(target=monitor, args=(state, state_lock, stop_event), daemon=True).start()
+
+    # Check for --ui flag to start desktop UI
+    if "--ui" in sys.argv:
+        from ui import run_ui
+        try:
+            run_ui(
+                state=state,
+                state_lock=state_lock,
+                companion_ai=companion_ai,
+                tool_registry=tool_registry,
+                task_executor=task_executor,
+            )
+        finally:
+            stop_event.set()
+        return
+
+    print("BLINDSPOT — quiet vision + OCR online\n")
 
     # command loop (MAIN THREAD — typing works)
     try:
@@ -491,6 +543,7 @@ def main():
                     print(f"{activity}: {format_time(seconds)}")
 
     except (KeyboardInterrupt, EOFError):
+        stop_event.set()
         # close current context on exit
         now = time.time()
         with state_lock:
