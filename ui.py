@@ -340,6 +340,8 @@ class BlindspotMainWindow:
         self._is_destroyed = False
         self._active_worker: Optional[threading.Thread] = None
         self._active_approval_event: Optional[threading.Event] = None
+        self._approval_lock = threading.Lock()
+        self._on_approval_waiting: Optional[Callable[[], None]] = None
         self._last_plan_res: Optional[Dict[str, Any]] = None
 
         self._init_window()
@@ -585,18 +587,24 @@ class BlindspotMainWindow:
         Called by ToolRegistry on a background execution worker thread.
         Prompts user on the main UI thread via Tk messagebox.
         """
-        if self._is_destroyed:
-            return False
-
-        approved = [False]
-        evt = threading.Event()
-        self._active_approval_event = evt
+        with self._approval_lock:
+            if self._is_destroyed:
+                return False
+            approved = [False]
+            evt = threading.Event()
+            self._active_approval_event = evt
 
         def _prompt():
-            if self._is_destroyed:
-                evt.set()
-                return
+            with self._approval_lock:
+                if self._is_destroyed:
+                    approved[0] = False
+                    evt.set()
+                    return
             try:
+                if not self.root or not self.root.winfo_exists():
+                    approved[0] = False
+                    evt.set()
+                    return
                 args_str = ", ".join(f"{k}={v!r}" for k, v in request.args.items()) if request.args else "none"
                 msg = (
                     f"BLINDSPOT Action Permission Request\n\n"
@@ -618,12 +626,35 @@ class BlindspotMainWindow:
                 evt.set()
 
         try:
+            with self._approval_lock:
+                if self._is_destroyed:
+                    self._active_approval_event = None
+                    return False
             self.root.after(0, _prompt)
         except Exception:
+            with self._approval_lock:
+                if self._active_approval_event is evt:
+                    self._active_approval_event = None
             return False
 
-        evt.wait()
-        self._active_approval_event = None
+        # Signal that the approver is actively waiting on the approval event
+        if self._on_approval_waiting is not None:
+            try:
+                self._on_approval_waiting()
+            except Exception:
+                pass
+
+        while not evt.is_set():
+            with self._approval_lock:
+                if self._is_destroyed:
+                    approved[0] = False
+                    break
+            evt.wait(timeout=0.05)
+
+        with self._approval_lock:
+            if self._active_approval_event is evt:
+                self._active_approval_event = None
+
         return approved[0]
 
     def _refresh_view(self) -> None:
@@ -994,10 +1025,11 @@ class BlindspotMainWindow:
 
     def on_close(self) -> None:
         """Clean shutdown handler."""
-        self._is_destroyed = True
-        if self._active_approval_event is not None:
-            self._active_approval_event.set()
-            self._active_approval_event = None
+        with self._approval_lock:
+            self._is_destroyed = True
+            if self._active_approval_event is not None:
+                self._active_approval_event.set()
+                self._active_approval_event = None
 
         if self._poll_job is not None:
             try:

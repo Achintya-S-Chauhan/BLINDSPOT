@@ -776,6 +776,10 @@ class TestPhase8BControlledExecution(unittest.TestCase):
                 description="Test action request",
             )
 
+            ready_evt = threading.Event()
+            app._on_approval_waiting = ready_evt.set
+            app.root.after = MagicMock()
+
             # Start worker thread requesting approval
             approval_result = [None]
             def _request_worker():
@@ -783,7 +787,14 @@ class TestPhase8BControlledExecution(unittest.TestCase):
 
             t = threading.Thread(target=_request_worker, daemon=True)
             t.start()
-            time.sleep(0.1)
+
+            # Ensure the worker has reached the approval synchronization point before closing
+            self.assertTrue(
+                ready_evt.wait(timeout=2.0),
+                "Worker thread failed to reach approval registration point",
+            )
+            with app._approval_lock:
+                self.assertIsNotNone(app._active_approval_event)
 
             # Close window
             app.on_close()
