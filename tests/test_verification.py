@@ -13,6 +13,7 @@ Covers:
 """
 
 import unittest
+from unittest.mock import patch
 from context import DesktopContext, RawObservation, InterpretedContext
 from desktop_io import MockDesktopIO
 from task import (
@@ -398,6 +399,202 @@ class TestTaskExecutorVerificationIntegration(unittest.TestCase):
         self.assertEqual(summary.verified_steps, 2)
         self.assertEqual(task.steps[0].verification.status, VerificationStatus.VERIFIED)
         self.assertEqual(task.steps[1].verification.status, VerificationStatus.VERIFIED)
+
+class TestGenuineVerificationRegression(unittest.TestCase):
+    """
+    Phase 8C Stage 2 Regression Tests: Genuine Desktop Verification.
+    Proves that:
+    1. MockDesktopIO changing its internal active_window alone cannot produce VERIFIED status.
+    2. A real-observation mismatch does not produce VERIFIED status.
+    3. A fresh observation matching the expected result can verify the action.
+    4. Delayed window changes are handled within a bounded timeout.
+    5. Timeout or observer failure fails safely.
+    """
+
+    def test_mock_desktop_io_active_window_alone_cannot_verify(self):
+        """01. MockDesktopIO changing its internal active_window alone CANNOT produce VERIFIED status."""
+        mock_io = MockDesktopIO()
+        reg = create_default_tool_registry(
+            allow_actions=True,
+            permission_policy=PermissionPolicy(low_risk_approver=lambda req: True),
+            desktop_io=mock_io,
+            include_action_tools=True,
+        )
+
+        # Observer sees "Calculator", NOT Notepad.
+        # But MockDesktopIO will simulate opening Notepad and set mock_io.active_window = "Notepad".
+        observer = MockDesktopObserver(window_title="Calculator")
+        verifier = TaskVerifier(observer=observer, poll_timeout=0.0)
+        executor = TaskExecutor(tool_registry=reg, verifier=verifier)
+
+        task = create_task(
+            user_request="Open notepad",
+            steps_data=[{"tool_name": "open_application", "args": {"app_name": "notepad"}}],
+        )
+
+        summary = executor.execute(task)
+
+        # The mock IO tool returned success and mock_io.active_window was updated,
+        # but genuine verification must fail because observer saw Calculator!
+        self.assertEqual(mock_io.active_window, "notepad")
+        self.assertEqual(summary.status, TaskStatus.FAILED)
+        self.assertEqual(summary.executed_steps, 1)
+        self.assertEqual(summary.verified_steps, 0)
+        self.assertEqual(task.steps[0].verification.status, VerificationStatus.FAILED)
+        self.assertIn("Verification failed", task.steps[0].verification.message)
+
+    def test_observation_mismatch_does_not_produce_verified(self):
+        """02. A real-observation mismatch does not produce VERIFIED status for open or focus."""
+        observer = MockDesktopObserver(window_title="Google Chrome")
+        verifier = TaskVerifier(observer=observer, poll_timeout=0.0)
+
+        # open_application mismatch
+        step_open = TaskStep(step_id=1, tool_name="open_application", args={"app_name": "notepad"})
+        res_open = verifier.verify_step(step_open)
+        self.assertEqual(res_open.status, VerificationStatus.FAILED)
+        self.assertEqual(res_open.details["observed_window"], "Google Chrome")
+
+        # focus_application mismatch
+        step_focus = TaskStep(step_id=2, tool_name="focus_application", args={"window_title_fragment": "Notepad"})
+        res_focus = verifier.verify_step(step_focus)
+        self.assertEqual(res_focus.status, VerificationStatus.FAILED)
+        self.assertEqual(res_focus.details["observed_window"], "Google Chrome")
+
+    def test_fresh_observation_matching_verifies_action(self):
+        """03. A fresh observation matching the expected result can verify the action."""
+        # Using DefaultContextObserver with fresh provider
+        calls = []
+
+        def _fresh_provider():
+            calls.append(1)
+            raw = RawObservation(window_title="Untitled - Notepad", ocr_text="")
+            interp = InterpretedContext(activity="using an application", confidence=3)
+            return DesktopContext(observation=raw, interpretation=interp)
+
+        observer = DefaultContextObserver(context_provider=_fresh_provider)
+        verifier = TaskVerifier(observer=observer, poll_timeout=0.1)
+
+        step = TaskStep(step_id=1, tool_name="open_application", args={"app_name": "notepad"})
+        res = verifier.verify_step(step)
+
+        self.assertEqual(res.status, VerificationStatus.VERIFIED)
+        self.assertGreaterEqual(len(calls), 1)
+        self.assertEqual(res.details["observed_window"], "Untitled - Notepad")
+
+    def test_delayed_window_change_handled_within_bounded_timeout(self):
+        """04. Delayed window changes are polled and verified within bounded timeout."""
+        call_count = {"n": 0}
+
+        def _delayed_observer():
+            call_count["n"] += 1
+            # First 2 calls: window hasn't appeared yet.
+            if call_count["n"] < 3:
+                title = "Program Manager"
+            else:
+                title = "Untitled - Notepad"
+            raw = RawObservation(window_title=title, ocr_text="")
+            interp = InterpretedContext(activity="using an application", confidence=2)
+            return DesktopContext(observation=raw, interpretation=interp)
+
+        verifier = TaskVerifier(
+            observer=_delayed_observer,
+            poll_timeout=0.5,
+            poll_interval=0.01,
+        )
+
+        step = TaskStep(step_id=1, tool_name="open_application", args={"app_name": "notepad"})
+        res = verifier.verify_step(step)
+
+        self.assertEqual(res.status, VerificationStatus.VERIFIED)
+        self.assertGreaterEqual(call_count["n"], 3)
+        self.assertEqual(res.details["observed_window"], "Untitled - Notepad")
+
+    def test_timeout_fails_safely_when_window_never_appears(self):
+        """05. Timeout returns failed verification safely without hanging or fabricating success."""
+        call_count = {"n": 0}
+
+        def _stuck_observer():
+            call_count["n"] += 1
+            raw = RawObservation(window_title="Desktop", ocr_text="")
+            interp = InterpretedContext(activity="idle", confidence=1)
+            return DesktopContext(observation=raw, interpretation=interp)
+
+        verifier = TaskVerifier(
+            observer=_stuck_observer,
+            poll_timeout=0.08,
+            poll_interval=0.01,
+        )
+
+        step = TaskStep(step_id=1, tool_name="open_application", args={"app_name": "notepad"})
+        res = verifier.verify_step(step)
+
+        self.assertEqual(res.status, VerificationStatus.FAILED)
+        self.assertGreaterEqual(call_count["n"], 1)
+        self.assertIn("Verification failed", res.message)
+        self.assertEqual(res.details["observed_window"], "Desktop")
+
+    def test_observer_failure_fails_safely_closed(self):
+        """06. Observer raising an exception fails closed safely."""
+        def _exploding_observer():
+            raise RuntimeError("Perception subsystem crashed or window handle invalid")
+
+        verifier = TaskVerifier(
+            observer=_exploding_observer,
+            poll_timeout=0.02,
+            poll_interval=0.01,
+        )
+
+        step = TaskStep(step_id=1, tool_name="open_application", args={"app_name": "notepad"})
+        res = verifier.verify_step(step)
+
+        self.assertEqual(res.status, VerificationStatus.FAILED)
+        self.assertIn("Verification failed", res.message)
+
+    @patch("eyes.window.get_active_window", return_value="")
+    def test_stale_cached_context_cannot_verify_when_fresh_perception_fails(self, mock_get_win):
+        """07. Stale cached context matching target cannot produce VERIFIED when fresh perception fails."""
+        stale_ctx = DesktopContext(
+            observation=RawObservation(window_title="Untitled - Notepad", ocr_text=""),
+            interpretation=InterpretedContext(activity="writing", confidence=2),
+        )
+        state = {"current_context": stale_ctx}
+        observer = DefaultContextObserver(state=state, prefer_fresh_window=True)
+        verifier = TaskVerifier(observer=observer, poll_timeout=0.0)
+
+        step = TaskStep(step_id=1, tool_name="open_application", args={"app_name": "notepad"})
+        res = verifier.verify_step(step)
+
+        # Fresh perception saw "", stale context must NOT be used to fabricate success
+        self.assertEqual(res.status, VerificationStatus.FAILED)
+        self.assertEqual(res.details["observed_window"], "")
+
+    @patch("eyes.window.get_active_window", return_value="")
+    def test_empty_live_observation_fails_verification_safely(self, mock_get_win):
+        """08. An empty live observation fails verification safely."""
+        observer = DefaultContextObserver(prefer_fresh_window=True)
+        verifier = TaskVerifier(observer=observer, poll_timeout=0.0)
+
+        step_open = TaskStep(step_id=1, tool_name="open_application", args={"app_name": "notepad"})
+        res_open = verifier.verify_step(step_open)
+        self.assertEqual(res_open.status, VerificationStatus.FAILED)
+        self.assertEqual(res_open.details["observed_window"], "")
+
+        step_focus = TaskStep(step_id=2, tool_name="focus_application", args={"window_title_fragment": "notepad"})
+        res_focus = verifier.verify_step(step_focus)
+        self.assertEqual(res_focus.status, VerificationStatus.FAILED)
+        self.assertEqual(res_focus.details["observed_window"], "")
+
+    @patch("eyes.window.get_active_window", return_value="Untitled - Notepad")
+    def test_genuinely_fresh_matching_observation_verifies(self, mock_get_win):
+        """09. A genuinely fresh matching observation verifies successfully."""
+        observer = DefaultContextObserver(prefer_fresh_window=True)
+        verifier = TaskVerifier(observer=observer, poll_timeout=0.0)
+
+        step = TaskStep(step_id=1, tool_name="open_application", args={"app_name": "notepad"})
+        res = verifier.verify_step(step)
+
+        self.assertEqual(res.status, VerificationStatus.VERIFIED)
+        self.assertEqual(res.details["observed_window"], "Untitled - Notepad")
 
 
 if __name__ == "__main__":

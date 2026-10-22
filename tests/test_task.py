@@ -37,6 +37,7 @@ from tools import (
 )
 from desktop_io import MockDesktopIO
 from ai import CompanionAI, LLMProvider
+from verification import TaskVerifier, MockDesktopObserver
 
 
 class MockStepTool(BaseTool):
@@ -306,8 +307,8 @@ class TestTaskExecutionFoundation(unittest.TestCase):
         )
         ai = CompanionAI(tool_registry=reg)
         task = ai.plan_task("Open Notepad and focus it")
-
-        executor = TaskExecutor(tool_registry=reg)
+        verifier = TaskVerifier(observer=MockDesktopObserver(window_title="Untitled - Notepad"))
+        executor = TaskExecutor(tool_registry=reg, verifier=verifier)
         summary = executor.execute(task)
 
         self.assertEqual(summary.status, TaskStatus.COMPLETED)
@@ -346,7 +347,8 @@ class TestTaskReliabilityPhase7B(unittest.TestCase):
             desktop_io=self.mock_io,
             include_action_tools=True,
         )
-        self.executor = TaskExecutor(tool_registry=self.registry, pre_validate=True)
+        self.verifier = TaskVerifier(observer=MockDesktopObserver(window_title="Untitled - Notepad"))
+        self.executor = TaskExecutor(tool_registry=self.registry, pre_validate=True, verifier=self.verifier)
 
     def test_plan_task_valid_parsing(self):
         """01. Valid JSON plan from LLM is correctly parsed into a Task."""

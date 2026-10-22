@@ -13,7 +13,8 @@ Provides:
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 import enum
-from typing import Dict, Any, Optional, Callable, List
+import time
+from typing import Dict, Any, Optional, Callable, List, Tuple
 from context import DesktopContext, RawObservation, InterpretedContext
 
 
@@ -61,6 +62,10 @@ class DesktopObserver(ABC):
         """Obtain current desktop context."""
         ...
 
+    def observe_fresh(self) -> DesktopContext:
+        """Obtain instantaneous desktop context without relying on cached perception state."""
+        return self.observe()
+
 
 class DefaultContextObserver(DesktopObserver):
     """
@@ -77,11 +82,16 @@ class DefaultContextObserver(DesktopObserver):
         self,
         context_provider: Optional[Callable[[], Optional[DesktopContext]]] = None,
         state: Optional[Dict[str, Any]] = None,
+        prefer_fresh_window: bool = False,
     ):
         self._provider = context_provider
         self._state = state
+        self._prefer_fresh_window = prefer_fresh_window
 
     def observe(self) -> DesktopContext:
+        if self._prefer_fresh_window:
+            return self.observe_fresh()
+
         # 1. Custom provider
         if self._provider is not None:
             try:
@@ -98,6 +108,51 @@ class DefaultContextObserver(DesktopObserver):
                 return ctx
 
         # 3. Existing perception modules
+        return self._query_perception_modules()
+
+    def observe_fresh(self) -> DesktopContext:
+        """Obtain instantaneous desktop context using live OS window query."""
+        # 1. Custom provider takes highest precedence
+        if self._provider is not None:
+            try:
+                ctx = self._provider()
+                if ctx is not None:
+                    return ctx
+            except Exception:
+                pass
+
+        # 2. Query live OS window detection module directly
+        try:
+            from eyes.window import get_active_window, get_active_window_rect
+            from eyes.interpreter import interpret_context
+
+            window_title = get_active_window()
+            if window_title is not None and str(window_title).strip():
+                rect = get_active_window_rect()
+                activity, confidence = interpret_context(window_title, "")
+                obs = RawObservation(
+                    window_title=window_title,
+                    ocr_text="",
+                    window_rect=rect,
+                )
+                interp = InterpretedContext(
+                    activity=activity,
+                    confidence=confidence,
+                )
+                return DesktopContext(
+                    observation=obs,
+                    interpretation=interp,
+                )
+        except Exception:
+            pass
+
+        # 3. Safe empty fallback — do not use cached state['current_context'] for fresh observation
+        return DesktopContext(
+            observation=RawObservation(window_title="", ocr_text=""),
+            interpretation=InterpretedContext(activity="unknown", confidence=0),
+        )
+
+    def _query_perception_modules(self) -> DesktopContext:
         try:
             from eyes.window import get_active_window, get_active_window_rect
             from eyes.interpreter import interpret_context
@@ -146,6 +201,9 @@ class MockDesktopObserver(DesktopObserver):
         interp = InterpretedContext(activity="using an application", confidence=2)
         return DesktopContext(observation=obs, interpretation=interp)
 
+    def observe_fresh(self) -> DesktopContext:
+        return self.observe()
+
 
 # ============================================================
 # TASK STEP VERIFIER
@@ -154,6 +212,7 @@ class MockDesktopObserver(DesktopObserver):
 class TaskVerifier:
     """
     Verifies the outcome of individual task steps against observed desktop context.
+    Uses bounded polling to accommodate asynchronous desktop application launches.
     """
 
     APP_ALIASES: Dict[str, List[str]] = {
@@ -164,9 +223,14 @@ class TaskVerifier:
         "explorer": ["explorer", "file explorer"],
     }
 
-    def __init__(self, observer: Optional[Any] = None):
+    def __init__(
+        self,
+        observer: Optional[Any] = None,
+        poll_timeout: Optional[float] = None,
+        poll_interval: float = 0.05,
+    ):
         if observer is None:
-            self._observer: DesktopObserver = DefaultContextObserver()
+            self._observer: DesktopObserver = DefaultContextObserver(prefer_fresh_window=True)
         elif hasattr(observer, "observe"):
             self._observer = observer
         elif callable(observer):
@@ -180,27 +244,56 @@ class TaskVerifier:
                     return DesktopContext(observation=obs, interpretation=interp)
             self._observer = _CallableObserver()
         else:
-            self._observer = DefaultContextObserver()
+            self._observer = DefaultContextObserver(prefer_fresh_window=True)
+
+        if poll_timeout is not None:
+            self.poll_timeout: float = max(0.0, float(poll_timeout))
+        elif isinstance(self._observer, DefaultContextObserver) and self._observer._provider is None:
+            self.poll_timeout = 2.5
+        else:
+            self.poll_timeout = 0.0
+
+        self.poll_interval: float = max(0.001, float(poll_interval))
 
     @property
     def observer(self) -> DesktopObserver:
         return self._observer
 
-    def _get_context(self, tool: Optional[Any] = None) -> DesktopContext:
-        # Check if the tool has an active_window on its MockDesktopIO
-        if tool is not None:
-            io = getattr(tool, "_io", None)
-            if io is not None and hasattr(io, "active_window") and io.active_window is not None:
-                # If using DefaultContextObserver, prefer mock active_window over live desktop
-                if isinstance(self._observer, DefaultContextObserver):
-                    obs = RawObservation(window_title=io.active_window, ocr_text="")
-                    interp = InterpretedContext(activity="using an application", confidence=2)
-                    return DesktopContext(observation=obs, interpretation=interp)
+    def _get_fresh_context(self) -> DesktopContext:
+        if hasattr(self._observer, "observe_fresh") and callable(self._observer.observe_fresh):
+            return self._observer.observe_fresh()
         return self._observer.observe()
+
+    def _poll_for_window(
+        self,
+        predicate: Callable[[str], bool],
+    ) -> Tuple[bool, DesktopContext]:
+        start = time.time()
+        timeout = self.poll_timeout
+        interval = self.poll_interval
+
+        while True:
+            try:
+                ctx = self._get_fresh_context()
+            except Exception:
+                ctx = DesktopContext(
+                    observation=RawObservation(window_title="", ocr_text=""),
+                    interpretation=InterpretedContext(activity="unknown", confidence=0),
+                )
+
+            title = (ctx.window_title or "").strip()
+            if predicate(title):
+                return True, ctx
+
+            if timeout <= 0.0 or (time.time() - start) >= timeout:
+                return False, ctx
+
+            time.sleep(min(interval, max(0.0, timeout - (time.time() - start))))
 
     def verify_step(self, step: Any, tool: Optional[Any] = None) -> StepVerificationResult:
         """
-        Verify the post-execution state of a task step.
+        Verify the post-execution state of a task step against observed desktop state.
+        Never fabricates verification status from mock tool attributes.
         """
         tool_name = getattr(step, "tool_name", "")
         if tool_name == "open_application":
@@ -224,12 +317,14 @@ class TaskVerifier:
                 details={"args": args},
             )
 
-        context = self._get_context(tool)
-        observed_title = (context.window_title or "").strip()
-        observed_lower = observed_title.lower()
-
         aliases = self.APP_ALIASES.get(app_name, [app_name])
-        matched = any(alias in observed_lower for alias in aliases)
+
+        def _matches(observed_title: str) -> bool:
+            obs_lower = observed_title.lower()
+            return any(alias in obs_lower for alias in aliases)
+
+        matched, context = self._poll_for_window(_matches)
+        observed_title = (context.window_title or "").strip()
 
         if matched:
             return StepVerificationResult(
@@ -265,10 +360,15 @@ class TaskVerifier:
                 details={"args": args},
             )
 
-        context = self._get_context(tool)
+        frag_lower = fragment.lower()
+
+        def _matches(observed_title: str) -> bool:
+            return frag_lower in observed_title.lower()
+
+        matched, context = self._poll_for_window(_matches)
         observed_title = (context.window_title or "").strip()
 
-        if fragment.lower() in observed_title.lower():
+        if matched:
             return StepVerificationResult(
                 status=VerificationStatus.VERIFIED,
                 message=f"Window focus verified for fragment '{fragment}' (observed active window: '{observed_title}').",

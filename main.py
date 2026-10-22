@@ -18,7 +18,12 @@ from tools import (
     ActionRequest,
     BLOCKED_DANGEROUS_TOOL_NAMES,
 )
-from desktop_io import MockDesktopIO
+from desktop_io import (
+    MockDesktopIO,
+    WindowsDesktopIO,
+    get_default_desktop_io,
+    get_backend_label,
+)
 from task import TaskExecutor, TaskStatus, validate_task
 from verification import TaskVerifier, DefaultContextObserver
 
@@ -198,7 +203,7 @@ def monitor(state, lock, stop_event=None):
 
 
 # ---------------- SYSTEM INITIALIZATION ----------------
-def initialize_system(desktop_io=None, allow_actions=True, low_risk_approver=None):
+def initialize_system(desktop_io=None, allow_actions=True, low_risk_approver=None, mock_io=False):
     """Factory to construct shared state, tool registry, and AI components."""
     conversation = ConversationSession(maxlen=20)
     history = ContextHistory(maxlen=50)
@@ -221,7 +226,11 @@ def initialize_system(desktop_io=None, allow_actions=True, low_risk_approver=Non
     }
 
     if desktop_io is None:
-        desktop_io = MockDesktopIO()
+        desktop_io = get_default_desktop_io(mock=mock_io)
+
+    state["desktop_io"] = desktop_io
+    backend_label = get_backend_label(desktop_io)
+    print(f"[BACKEND] Active Desktop I/O: {backend_label} ({desktop_io.__class__.__name__})")
 
     permission_policy = PermissionPolicy(low_risk_approver=low_risk_approver)
 
@@ -240,7 +249,7 @@ def initialize_system(desktop_io=None, allow_actions=True, low_risk_approver=Non
     analyzer = ContextualUnderstandingAnalyzer()
     assistant = CompanionAssistant()
     companion_ai = CompanionAI(conversation=conversation, tool_registry=tool_registry)
-    verifier = TaskVerifier(observer=DefaultContextObserver(state=state))
+    verifier = TaskVerifier(observer=DefaultContextObserver(state=state, prefer_fresh_window=True))
     task_executor = TaskExecutor(tool_registry=tool_registry, verifier=verifier)
 
     stop_event = threading.Event()
@@ -256,6 +265,7 @@ def initialize_system(desktop_io=None, allow_actions=True, low_risk_approver=Non
         "task_executor": task_executor,
         "verifier": verifier,
         "stop_event": stop_event,
+        "desktop_io": desktop_io,
     }
 
 
@@ -276,7 +286,11 @@ def main():
             return False
 
     is_ui_mode = "--ui" in sys.argv
-    components = initialize_system(low_risk_approver=None if is_ui_mode else _cli_approver)
+    use_mock_io = "--mock-io" in sys.argv
+    components = initialize_system(
+        low_risk_approver=None if is_ui_mode else _cli_approver,
+        mock_io=use_mock_io,
+    )
     state = components["state"]
     state_lock = components["state_lock"]
     analyzer = components["analyzer"]
@@ -285,6 +299,7 @@ def main():
     tool_registry = components["tool_registry"]
     task_executor = components["task_executor"]
     stop_event = components["stop_event"]
+    desktop_io = components["desktop_io"]
 
     # start monitor in background
     threading.Thread(target=monitor, args=(state, state_lock, stop_event), daemon=True).start()
@@ -299,12 +314,14 @@ def main():
                 companion_ai=companion_ai,
                 tool_registry=tool_registry,
                 task_executor=task_executor,
+                desktop_io=desktop_io,
             )
         finally:
             stop_event.set()
         return
 
-    print("BLINDSPOT — quiet vision + OCR online\n")
+    backend_label = get_backend_label(desktop_io)
+    print(f"BLINDSPOT — quiet vision + OCR online [{backend_label}]\n")
 
     # command loop (MAIN THREAD — typing works)
     try:

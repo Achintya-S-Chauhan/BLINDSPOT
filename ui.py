@@ -53,6 +53,7 @@ class UIStateBridge:
         tool_registry: Optional[Any] = None,
         task_executor: Optional[Any] = None,
         action_approver: Optional[Callable[[ActionRequest], bool]] = None,
+        desktop_io: Optional[Any] = None,
     ):
         self.state = state
         self.state_lock = state_lock
@@ -60,6 +61,7 @@ class UIStateBridge:
         self.tool_registry = tool_registry
         self.task_executor = task_executor
         self.action_approver = action_approver
+        self.desktop_io = desktop_io or (state.get("desktop_io") if state else None)
 
         # Phase 8B Task & Execution state
         self.pending_task: Optional[Task] = None
@@ -344,6 +346,12 @@ class BlindspotMainWindow:
         self._on_approval_waiting: Optional[Callable[[], None]] = None
         self._last_plan_res: Optional[Dict[str, Any]] = None
 
+        self.desktop_io = getattr(bridge, "desktop_io", None)
+        if self.desktop_io is None and bridge.state:
+            self.desktop_io = bridge.state.get("desktop_io")
+        from desktop_io import get_backend_label
+        self.backend_label = get_backend_label(self.desktop_io)
+
         self._init_window()
         self._setup_styles()
         self._build_widgets()
@@ -423,6 +431,12 @@ class BlindspotMainWindow:
             foreground=self.COLOR_STOPPED,
             font=("Segoe UI", 11, "bold"),
         )
+        style.configure(
+            "BackendBadge.TLabel",
+            background=self.BG_DARK,
+            foreground="#89b4fa" if self.backend_label == "REAL WINDOWS I/O" else "#f9e2af",
+            font=("Segoe UI", 9, "bold"),
+        )
 
         style.configure(
             "Footer.TLabel",
@@ -456,6 +470,13 @@ class BlindspotMainWindow:
 
         ctrl_box = ttk.Frame(header_frame, style="Root.TFrame")
         ctrl_box.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.backend_badge = ttk.Label(
+            ctrl_box,
+            text=f"[{self.backend_label}]",
+            style="BackendBadge.TLabel",
+        )
+        self.backend_badge.pack(side=tk.LEFT, padx=(0, 10))
 
         self.status_badge = ttk.Label(ctrl_box, text="● RUNNING", style="StatusRunning.TLabel")
         self.status_badge.pack(side=tk.LEFT, padx=(0, 10))
@@ -580,6 +601,13 @@ class BlindspotMainWindow:
             style="Footer.TLabel",
         )
         self.footer_label.pack(side=tk.LEFT)
+
+        self.footer_backend_label = ttk.Label(
+            footer_frame,
+            text=f"Backend: {self.backend_label}",
+            style="Footer.TLabel",
+        )
+        self.footer_backend_label.pack(side=tk.RIGHT)
 
     def _ui_action_approver(self, request: ActionRequest) -> bool:
         """
@@ -1051,6 +1079,7 @@ def run_ui(
     tool_registry: Optional[Any] = None,
     task_executor: Optional[Any] = None,
     action_approver: Optional[Callable[[ActionRequest], bool]] = None,
+    desktop_io: Optional[Any] = None,
 ) -> None:
     """Launch the BLINDSPOT desktop window."""
     bridge = UIStateBridge(
@@ -1060,6 +1089,7 @@ def run_ui(
         tool_registry=tool_registry,
         task_executor=task_executor,
         action_approver=action_approver,
+        desktop_io=desktop_io,
     )
     root = tk.Tk()
     BlindspotMainWindow(root=root, bridge=bridge, action_approver=action_approver)
@@ -1070,10 +1100,12 @@ def main():
     """Standalone entry point for launching BLINDSPOT with UI."""
     from main import initialize_system, monitor
 
-    components = initialize_system()
+    use_mock_io = "--mock-io" in sys.argv
+    components = initialize_system(mock_io=use_mock_io)
     state = components["state"]
     state_lock = components["state_lock"]
     stop_event = components["stop_event"]
+    desktop_io = components.get("desktop_io")
 
     # Start background perception monitor thread
     monitor_thread = threading.Thread(
@@ -1090,6 +1122,7 @@ def main():
             companion_ai=components["companion_ai"],
             tool_registry=components["tool_registry"],
             task_executor=components["task_executor"],
+            desktop_io=desktop_io,
         )
     finally:
         stop_event.set()

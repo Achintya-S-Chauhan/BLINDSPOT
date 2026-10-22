@@ -689,6 +689,252 @@ class TestDesktopIOResult(unittest.TestCase):
         self.assertTrue(res.metadata.get("simulated_failure"))
 
 
+class TestWindowsDesktopIOFocus(unittest.TestCase):
+    """Unit tests for WindowsDesktopIO native Win32 window focus."""
+
+    def test_78a_focus_empty_fragment_returns_failure(self):
+        io = WindowsDesktopIO()
+        res = io.focus_application("")
+        self.assertFalse(res.success)
+        self.assertIn("non-empty string", res.error)
+
+    def test_78b_focus_no_matching_window_returns_failure(self):
+        io = WindowsDesktopIO()
+        mock_win32gui = MagicMock()
+        mock_win32con = MagicMock()
+
+        # EnumWindows finds nothing
+        def _mock_enum(cb, extra):
+            return True
+
+        mock_win32gui.EnumWindows.side_effect = _mock_enum
+        with patch.object(io, "_try_import_win32", return_value=(mock_win32gui, mock_win32con)):
+            res = io.focus_application("NonExistentXYZWindow")
+            self.assertFalse(res.success)
+            self.assertIn("No window found with title containing", res.error)
+
+    def test_78c_focus_matching_normal_window_activates(self):
+        io = WindowsDesktopIO()
+        mock_win32gui = MagicMock()
+        mock_win32con = MagicMock()
+        mock_win32con.SW_SHOW = 5
+        mock_win32con.SW_RESTORE = 9
+
+        mock_win32gui.IsWindowVisible.return_value = True
+        mock_win32gui.GetWindowText.return_value = "Untitled - Notepad"
+        mock_win32gui.IsIconic.return_value = False
+        mock_win32gui.GetForegroundWindow.return_value = 12345
+
+        def _mock_enum(cb, extra):
+            cb(12345, None)
+            return True
+
+        mock_win32gui.EnumWindows.side_effect = _mock_enum
+        with patch.object(io, "_try_import_win32", return_value=(mock_win32gui, mock_win32con)):
+            res = io.focus_application("Notepad")
+            self.assertTrue(res.success)
+            self.assertEqual(res.metadata["hwnd"], 12345)
+            self.assertEqual(res.metadata["window_title"], "Untitled - Notepad")
+            mock_win32gui.ShowWindow.assert_called_once_with(12345, 5)
+            mock_win32gui.SetForegroundWindow.assert_called_once_with(12345)
+
+    def test_78d_focus_matching_minimized_window_restores(self):
+        io = WindowsDesktopIO()
+        mock_win32gui = MagicMock()
+        mock_win32con = MagicMock()
+        mock_win32con.SW_SHOW = 5
+        mock_win32con.SW_RESTORE = 9
+
+        mock_win32gui.IsWindowVisible.return_value = True
+        mock_win32gui.GetWindowText.return_value = "Calculator"
+        mock_win32gui.IsIconic.return_value = True
+        mock_win32gui.GetForegroundWindow.return_value = 54321
+
+        def _mock_enum(cb, extra):
+            cb(54321, None)
+            return True
+
+        mock_win32gui.EnumWindows.side_effect = _mock_enum
+        with patch.object(io, "_try_import_win32", return_value=(mock_win32gui, mock_win32con)):
+            res = io.focus_application("calc")
+            self.assertTrue(res.success)
+            mock_win32gui.ShowWindow.assert_called_once_with(54321, 9)
+            mock_win32gui.SetForegroundWindow.assert_called_once_with(54321)
+
+    def test_78e_focus_missing_libraries_returns_failure(self):
+        io = WindowsDesktopIO()
+        with patch.object(io, "_try_import_win32", return_value=(None, None)), \
+             patch.object(io, "_try_import_pygetwindow", return_value=None):
+            res = io.focus_application("Notepad")
+            self.assertFalse(res.success)
+            self.assertIn("Neither win32gui nor pygetwindow is available", res.error)
+
+    def test_78f_focus_activation_error_returns_structured_failure(self):
+        io = WindowsDesktopIO()
+        mock_win32gui = MagicMock()
+        mock_win32con = MagicMock()
+
+        mock_win32gui.IsWindowVisible.return_value = True
+        mock_win32gui.GetWindowText.return_value = "Test Window"
+        mock_win32gui.IsIconic.return_value = False
+        mock_win32gui.SetForegroundWindow.side_effect = RuntimeError("Access Denied")
+
+        def _mock_enum(cb, extra):
+            cb(99999, None)
+            return True
+
+        mock_win32gui.EnumWindows.side_effect = _mock_enum
+        with patch.object(io, "_try_import_win32", return_value=(mock_win32gui, mock_win32con)), \
+             patch("ctypes.windll.user32.SetForegroundWindow", side_effect=RuntimeError("Ctypes Denied")):
+            res = io.focus_application("Test")
+            self.assertFalse(res.success)
+            self.assertIn("Failed to focus window", res.error)
+
+    def test_78g_focus_set_foreground_returns_false_and_window_not_active_fails(self):
+        """SetForegroundWindow returns False without exception; fails if window is not foreground."""
+        io = WindowsDesktopIO()
+        mock_win32gui = MagicMock()
+        mock_win32con = MagicMock()
+
+        mock_win32gui.IsWindowVisible.return_value = True
+        mock_win32gui.GetWindowText.return_value = "Notepad Window"
+        mock_win32gui.IsIconic.return_value = False
+        # SetForegroundWindow returns False without raising
+        mock_win32gui.SetForegroundWindow.return_value = False
+        # GetForegroundWindow returns something else
+        mock_win32gui.GetForegroundWindow.return_value = 11111
+
+        def _mock_enum(cb, extra):
+            cb(22222, None)
+            return True
+
+        mock_win32gui.EnumWindows.side_effect = _mock_enum
+        with patch.object(io, "_try_import_win32", return_value=(mock_win32gui, mock_win32con)), \
+             patch("ctypes.windll.user32.SetForegroundWindow", return_value=0):
+            res = io.focus_application("Notepad")
+            self.assertFalse(res.success)
+            self.assertIn("Failed to focus window", res.error)
+
+    def test_78h_focus_set_foreground_returns_false_but_confirmed_active_succeeds(self):
+        """SetForegroundWindow returns False but subsequent GetForegroundWindow confirms activation."""
+        io = WindowsDesktopIO()
+        mock_win32gui = MagicMock()
+        mock_win32con = MagicMock()
+
+        mock_win32gui.IsWindowVisible.return_value = True
+        mock_win32gui.GetWindowText.return_value = "Notepad Window"
+        mock_win32gui.IsIconic.return_value = False
+        mock_win32gui.SetForegroundWindow.return_value = False
+        # Independent check confirms window is actually foreground
+        mock_win32gui.GetForegroundWindow.return_value = 22222
+
+        def _mock_enum(cb, extra):
+            cb(22222, None)
+            return True
+
+        mock_win32gui.EnumWindows.side_effect = _mock_enum
+        with patch.object(io, "_try_import_win32", return_value=(mock_win32gui, mock_win32con)):
+            res = io.focus_application("Notepad")
+            self.assertTrue(res.success)
+            self.assertEqual(res.metadata["hwnd"], 22222)
+
+    def test_78i_focus_ctypes_fallback_returns_zero_fails(self):
+        """ctypes fallback returns 0 and window is not active; fails structured."""
+        io = WindowsDesktopIO()
+        mock_win32gui = MagicMock()
+        mock_win32con = MagicMock()
+
+        mock_win32gui.IsWindowVisible.return_value = True
+        mock_win32gui.GetWindowText.return_value = "Notepad Window"
+        mock_win32gui.IsIconic.return_value = False
+        mock_win32gui.SetForegroundWindow.side_effect = RuntimeError("win32gui failed")
+        mock_win32gui.GetForegroundWindow.return_value = 11111
+
+        def _mock_enum(cb, extra):
+            cb(33333, None)
+            return True
+
+        mock_win32gui.EnumWindows.side_effect = _mock_enum
+        with patch.object(io, "_try_import_win32", return_value=(mock_win32gui, mock_win32con)), \
+             patch("ctypes.windll.user32.SetForegroundWindow", return_value=0):
+            res = io.focus_application("Notepad")
+            self.assertFalse(res.success)
+            self.assertIn("Failed to focus window", res.error)
+
+    def test_78j_focus_ctypes_fallback_returns_nonzero_succeeds(self):
+        """ctypes fallback returns 1 (nonzero) and window confirmed active; succeeds."""
+        io = WindowsDesktopIO()
+        mock_win32gui = MagicMock()
+        mock_win32con = MagicMock()
+
+        mock_win32gui.IsWindowVisible.return_value = True
+        mock_win32gui.GetWindowText.return_value = "Notepad Window"
+        mock_win32gui.IsIconic.return_value = False
+        mock_win32gui.SetForegroundWindow.side_effect = RuntimeError("win32gui failed")
+        mock_win32gui.GetForegroundWindow.return_value = 33333
+
+        def _mock_enum(cb, extra):
+            cb(33333, None)
+            return True
+
+        mock_win32gui.EnumWindows.side_effect = _mock_enum
+        with patch.object(io, "_try_import_win32", return_value=(mock_win32gui, mock_win32con)), \
+             patch("ctypes.windll.user32.SetForegroundWindow", return_value=1):
+            res = io.focus_application("Notepad")
+            self.assertTrue(res.success)
+            self.assertEqual(res.metadata["hwnd"], 33333)
+
+    def test_78k_focus_win32gui_returns_nonzero_but_window_not_active_fails(self):
+        """win32gui returns nonzero/True, but window does NOT actually become foreground; fails."""
+        io = WindowsDesktopIO()
+        mock_win32gui = MagicMock()
+        mock_win32con = MagicMock()
+
+        mock_win32gui.IsWindowVisible.return_value = True
+        mock_win32gui.GetWindowText.return_value = "Target Window"
+        mock_win32gui.IsIconic.return_value = False
+        # win32gui claims success
+        mock_win32gui.SetForegroundWindow.return_value = True
+        # but foreground window remains something else!
+        mock_win32gui.GetForegroundWindow.return_value = 99999
+
+        def _mock_enum(cb, extra):
+            cb(12345, None)
+            return True
+
+        mock_win32gui.EnumWindows.side_effect = _mock_enum
+        with patch.object(io, "_try_import_win32", return_value=(mock_win32gui, mock_win32con)), \
+             patch("ctypes.windll.user32.SetForegroundWindow", return_value=0):
+            res = io.focus_application("Target")
+            self.assertFalse(res.success)
+            self.assertIn("Failed to focus window", res.error)
+
+    def test_78l_focus_ctypes_returns_nonzero_but_window_not_active_fails(self):
+        """ctypes fallback returns 1 (nonzero), but window does NOT become foreground; fails."""
+        io = WindowsDesktopIO()
+        mock_win32gui = MagicMock()
+        mock_win32con = MagicMock()
+
+        mock_win32gui.IsWindowVisible.return_value = True
+        mock_win32gui.GetWindowText.return_value = "Target Window"
+        mock_win32gui.IsIconic.return_value = False
+        mock_win32gui.SetForegroundWindow.side_effect = RuntimeError("win32gui failed")
+        # ctypes claims success
+        # but foreground window remains something else!
+        mock_win32gui.GetForegroundWindow.return_value = 99999
+
+        def _mock_enum(cb, extra):
+            cb(12345, None)
+            return True
+
+        mock_win32gui.EnumWindows.side_effect = _mock_enum
+        with patch.object(io, "_try_import_win32", return_value=(mock_win32gui, mock_win32con)), \
+             patch("ctypes.windll.user32.SetForegroundWindow", return_value=1):
+            res = io.focus_application("Target")
+            self.assertFalse(res.success)
+            self.assertIn("Failed to focus window", res.error)
+
+
 # ============================================================
 # TEST: Regression — existing read-only tools still work
 # ============================================================

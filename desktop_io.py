@@ -17,6 +17,7 @@ success/failure response rather than raising exceptions.
 
 from __future__ import annotations
 
+import sys
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -145,6 +146,14 @@ class WindowsDesktopIO(DesktopIO):
         except ImportError:
             return None
 
+    def _try_import_win32(self):
+        try:
+            import win32gui
+            import win32con
+            return win32gui, win32con
+        except ImportError:
+            return None, None
+
     def _try_import_pygetwindow(self):
         try:
             import pygetwindow as gw
@@ -179,12 +188,118 @@ class WindowsDesktopIO(DesktopIO):
             )
 
     def focus_application(self, window_title_fragment: str) -> DesktopIOResult:
+        fragment_clean = (window_title_fragment or "").strip()
+        if not fragment_clean:
+            return DesktopIOResult(
+                success=False,
+                operation="focus_application",
+                error="window_title_fragment must be a non-empty string.",
+                metadata={"fragment": window_title_fragment},
+            )
+
+        win32gui_mod, win32con_mod = self._try_import_win32()
+        if win32gui_mod is not None:
+            fragment_lower = fragment_clean.lower()
+            matching_windows: List[Tuple[int, str]] = []
+
+            def _enum_callback(hwnd: int, _lparam: Any) -> bool:
+                try:
+                    if win32gui_mod.IsWindowVisible(hwnd):
+                        title = win32gui_mod.GetWindowText(hwnd)
+                        if title and fragment_lower in title.lower():
+                            matching_windows.append((hwnd, title))
+                except Exception:
+                    pass
+                return True
+
+            try:
+                win32gui_mod.EnumWindows(_enum_callback, None)
+            except Exception as e:
+                return DesktopIOResult(
+                    success=False,
+                    operation="focus_application",
+                    error=f"Failed to enumerate windows: {e}",
+                    metadata={"fragment": window_title_fragment},
+                )
+
+            if not matching_windows:
+                return DesktopIOResult(
+                    success=False,
+                    operation="focus_application",
+                    error=f"No window found with title containing '{window_title_fragment}'.",
+                    metadata={"fragment": window_title_fragment},
+                )
+
+            target_hwnd, target_title = matching_windows[0]
+
+            try:
+                # Restore window if minimized
+                if win32gui_mod.IsIconic(target_hwnd):
+                    win32gui_mod.ShowWindow(target_hwnd, win32con_mod.SW_RESTORE)
+                else:
+                    win32gui_mod.ShowWindow(target_hwnd, win32con_mod.SW_SHOW)
+            except Exception:
+                pass
+
+            def _is_foreground_confirmed() -> bool:
+                try:
+                    return win32gui_mod.GetForegroundWindow() == target_hwnd
+                except Exception:
+                    return False
+
+            focused = False
+            last_err = None
+
+            # Attempt 1: win32gui.SetForegroundWindow
+            try:
+                ret = win32gui_mod.SetForegroundWindow(target_hwnd)
+                # Never trust API return value alone; verify window actually became foreground
+                if ret is not False and ret != 0:
+                    focused = _is_foreground_confirmed()
+                else:
+                    focused = _is_foreground_confirmed()
+            except Exception as e:
+                last_err = e
+                focused = _is_foreground_confirmed()
+
+            # Attempt 2: ctypes user32.SetForegroundWindow fallback if not yet confirmed focused
+            if not focused:
+                try:
+                    import ctypes
+                    c_ret = ctypes.windll.user32.SetForegroundWindow(target_hwnd)
+                    # Check return value AND verify window actually became foreground
+                    if c_ret:
+                        focused = _is_foreground_confirmed()
+                    else:
+                        focused = _is_foreground_confirmed()
+                except Exception as e:
+                    if last_err is None:
+                        last_err = e
+                    focused = _is_foreground_confirmed()
+
+            if focused:
+                return DesktopIOResult(
+                    success=True,
+                    operation="focus_application",
+                    output=f"Focused window: '{target_title}'.",
+                    metadata={"window_title": target_title, "hwnd": target_hwnd},
+                )
+            else:
+                err_detail = f": {last_err}" if last_err else " (SetForegroundWindow returned failure and window was not active)"
+                return DesktopIOResult(
+                    success=False,
+                    operation="focus_application",
+                    error=f"Failed to focus window '{target_title}'{err_detail}",
+                    metadata={"fragment": window_title_fragment, "target_title": target_title, "hwnd": target_hwnd},
+                )
+
+        # Fallback to pygetwindow if win32gui is not available
         gw = self._try_import_pygetwindow()
         if gw is None:
             return DesktopIOResult(
                 success=False,
                 operation="focus_application",
-                error="pygetwindow is not installed. Cannot focus windows.",
+                error="Neither win32gui nor pygetwindow is available. Cannot focus windows.",
             )
         try:
             windows = gw.getWindowsWithTitle(window_title_fragment)
@@ -428,3 +543,33 @@ class MockDesktopIO(DesktopIO):
             filtered = [c for c in self.calls if c.method == method]
             return filtered[-1] if filtered else None
         return self.calls[-1] if self.calls else None
+
+
+# ============================================================
+# BACKEND FACTORY & SELECTION HELPERS
+# ============================================================
+
+def get_default_desktop_io(mock: bool = False) -> DesktopIO:
+    """
+    Select and instantiate the appropriate DesktopIO backend.
+
+    Selection rules:
+    - If `mock` is True: returns MockDesktopIO().
+    - On Windows (sys.platform == 'win32'): returns WindowsDesktopIO().
+    - On non-Windows platforms (e.g. Linux, macOS): returns MockDesktopIO()
+      to preserve cross-platform compatibility without crashing.
+    """
+    if mock:
+        return MockDesktopIO()
+    if sys.platform == "win32":
+        return WindowsDesktopIO()
+    return MockDesktopIO()
+
+
+def get_backend_label(desktop_io: Any) -> str:
+    """Return a human-readable label ('REAL WINDOWS I/O' or 'MOCK I/O') for the active backend."""
+    if isinstance(desktop_io, MockDesktopIO):
+        return "MOCK I/O"
+    elif isinstance(desktop_io, WindowsDesktopIO):
+        return "REAL WINDOWS I/O"
+    return "UNKNOWN I/O"
