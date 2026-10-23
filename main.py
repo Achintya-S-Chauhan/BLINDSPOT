@@ -304,6 +304,13 @@ def main():
     # start monitor in background
     threading.Thread(target=monitor, args=(state, state_lock, stop_event), daemon=True).start()
 
+    # Start dashboard API if requested via --api or --dashboard
+    if "--api" in sys.argv or "--dashboard" in sys.argv:
+        from api import attach_engine_state, start_api_server_background
+        attach_engine_state(state, state_lock, analyzer)
+        start_api_server_background(host="127.0.0.1", port=8000)
+        print("[API] BLINDSPOT Dashboard API running on http://127.0.0.1:8000")
+
     # Check for --ui flag to start desktop UI
     if "--ui" in sys.argv:
         from ui import run_ui
