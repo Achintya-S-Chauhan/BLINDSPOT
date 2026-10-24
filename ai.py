@@ -3,6 +3,7 @@ import json
 import time
 import urllib.request
 import urllib.error
+import re
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, Union
 from context import DesktopContext
@@ -19,6 +20,11 @@ class MissingAPIKeyError(Exception):
 
 class LLMProviderError(Exception):
     """Raised when an error occurs during LLM provider communication."""
+    pass
+
+
+class QuotaExceededError(LLMProviderError):
+    """Raised when the Gemini API quota or rate limit is exceeded (HTTP 429)."""
     pass
 
 
@@ -424,12 +430,40 @@ class GeminiProvider(LLMProvider):
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            err_msg = e.read().decode("utf-8", errors="replace")
+            raw_err = e.read().decode("utf-8", errors="replace")
             if clean_key:
-                err_msg = err_msg.replace(clean_key, "[REDACTED_API_KEY]")
-            raise LLMProviderError(f"Gemini API HTTP {e.code}: {e.reason} -> {err_msg.strip()}")
+                raw_err = raw_err.replace(clean_key, "[REDACTED_API_KEY]")
+            clean_reason = str(e.reason)
+            if clean_key:
+                clean_reason = clean_reason.replace(clean_key, "[REDACTED_API_KEY]")
+
+            # Parse error details if JSON
+            parsed_msg = None
+            is_quota_exhausted = (e.code == 429)
+            try:
+                err_data = json.loads(raw_err)
+                if isinstance(err_data, dict):
+                    err_obj = err_data.get("error", {})
+                    if isinstance(err_obj, dict):
+                        parsed_msg = err_obj.get("message")
+                        status = err_obj.get("status")
+                        code = err_obj.get("code")
+                        if status == "RESOURCE_EXHAUSTED" or code == 429:
+                            is_quota_exhausted = True
+            except Exception:
+                pass
+
+            if is_quota_exhausted:
+                detail = f": {parsed_msg}" if parsed_msg else ""
+                raise QuotaExceededError(f"Gemini API rate limit or quota exceeded (HTTP 429){detail}")
+
+            clean_err = parsed_msg if parsed_msg else raw_err.strip()
+            raise LLMProviderError(f"Gemini API HTTP {e.code}: {clean_reason} -> {clean_err}")
         except urllib.error.URLError as e:
-            raise LLMProviderError(f"Network error connecting to Gemini API: {e.reason}")
+            clean_reason = str(e.reason)
+            if clean_key:
+                clean_reason = clean_reason.replace(clean_key, "[REDACTED_API_KEY]")
+            raise LLMProviderError(f"Network error connecting to Gemini API: {clean_reason}")
         except Exception as e:
             raise LLMProviderError(f"Unexpected error communicating with Gemini API: {e}")
 
@@ -500,6 +534,180 @@ class GeminiProvider(LLMProvider):
         return "Maximum tool calling iterations exceeded."
 
 
+def deterministic_local_answer(
+    user_query: str,
+    current_context: Optional[DesktopContext],
+    context_start_time: Optional[float],
+    history: Optional[ContextHistory],
+    understanding: Optional[WorkflowUnderstanding],
+    now: Optional[float] = None,
+) -> Optional[str]:
+    """
+    Generate a deterministic, locally computed answer for basic desktop context questions.
+    Returns None if the user's query cannot be answered from local desktop context.
+    Never invents context; honestly reports when context is unavailable.
+    """
+    if not isinstance(user_query, str) or not user_query.strip():
+        return None
+
+    now = time.time() if now is None else now
+    q_norm = user_query.strip().lower()
+    q_clean = re.sub(r"[^\w\s]", " ", q_norm)
+    q_clean = " ".join(q_clean.split())
+
+    # 1. Summary requests
+    # e.g., "summary", "summarize my activity", "give me a desktop summary", "summarize what I've been doing"
+    summary_exact = {
+        "summary", "summarize", "summarise", "desktop summary", "activity summary",
+        "workspace summary", "session summary", "work summary", "quick summary",
+        "brief summary", "give me a summary", "give me a quick summary",
+        "give me a brief summary", "give a summary", "show summary", "get summary",
+        "provide a summary", "daily summary", "summary please", "give me a desktop summary",
+        "give me an activity summary", "summarize my activity", "summarize my activities",
+        "summarize my work", "summarize desktop", "summarize session",
+    }
+    summary_words = {"summary", "summarize", "summarise", "summarizing", "summarising"}
+    has_summary_word = any(w in summary_words for w in q_clean.split())
+    target_words = ["desktop", "activity", "activities", "workspace", "session", "work", "task", "tasks", "day", "today"]
+
+    is_summary_q = (
+        q_clean in summary_exact
+        or (
+            has_summary_word
+            and (
+                any(tw in q_clean for tw in target_words)
+                or (any(w in q_clean for w in ["doing", "done", "working", "spent"]) and any(p in q_clean.split() for p in ["i", "my", "me", "ve"]))
+                or (any(p in q_clean for p in ["give me a", "provide a", "show me a", "get a"]) and "summary" in q_clean and len(q_clean.split()) <= 6)
+            )
+        )
+    )
+
+    if is_summary_q:
+        act = current_context.activity if current_context else None
+        win = current_context.window_title if current_context else None
+        act_valid = bool(act and act.strip() and act.strip().lower() not in ("none", "no active context", "unknown", "idle", "no_activity"))
+        win_valid = bool(win and win.strip() and win.strip().lower() not in ("none", "no active window detected", "unknown"))
+
+        episodes = history.get_recent(limit=5) if history else []
+
+        if not act_valid and not win_valid and not episodes:
+            return "There is not enough recorded desktop activity or history to summarize."
+
+        lines = ["Desktop Activity Summary:"]
+
+        if act_valid or win_valid:
+            dur_sec = max(0.0, now - context_start_time) if context_start_time else 0.0
+            dur_str = f" (active for {format_duration(dur_sec)})" if dur_sec > 0 else ""
+            act_str = act.strip() if act_valid else "general activity"
+            win_str = f" in '{win.strip()}'" if win_valid else ""
+            interp_str = ""
+            if understanding and understanding.interpretation and understanding.pattern_type not in ("no_activity", "unknown"):
+                interp = understanding.interpretation.rstrip(".")
+                interp_str = f" Pattern: {interp}."
+            lines.append(f"Current Focus: {act_str}{win_str}{dur_str}.{interp_str}")
+        else:
+            lines.append("Current Focus: No active window or activity currently detected.")
+
+        if episodes:
+            lines.append(f"Recent Activity ({len(episodes)} recorded episode{'s' if len(episodes) != 1 else ''}):")
+            for idx, ep in enumerate(episodes, 1):
+                dur_str = format_duration(ep.duration) if ep.duration else "brief"
+                win_str = f" on '{ep.window_title}'" if ep.window_title else ""
+                lines.append(f"  {idx}. {ep.activity}{win_str} ({dur_str})")
+            if understanding and understanding.recent_activities and len(understanding.recent_activities) > 1:
+                flow_str = " -> ".join(understanding.recent_activities)
+                lines.append(f"Flow: {flow_str}")
+        else:
+            lines.append("Recent History: No prior activity transitions recorded yet in this session.")
+
+        return "\n".join(lines)
+
+    # 2. Window / Application questions
+    # e.g., "what window is active", "what window am i in", "active window", "what application is open"
+    window_keywords = [
+        "what window", "which window", "active window", "current window",
+        "what application", "which application", "active application",
+        "current application", "what app", "which app", "active app", "current app",
+    ]
+    is_window_q = any(kw in q_clean for kw in window_keywords) or (
+        ("window" in q_clean or "app" in q_clean or "application" in q_clean)
+        and any(w in q_clean for w in ["active", "current", "open", "focus", "using", "front"])
+    )
+
+    if is_window_q:
+        win = current_context.window_title if current_context else None
+        if win and win.strip() and win.strip().lower() not in ("none", "no active window detected", "unknown"):
+            dur_sec = max(0.0, now - context_start_time) if context_start_time else 0.0
+            dur_str = f" (active for {format_duration(dur_sec)})" if dur_sec > 0 else ""
+            return f"The active window is '{win.strip()}'{dur_str}."
+        return "No active window is currently detected."
+
+    # 3. Activity / Working on questions
+    # e.g., "what am i working on", "what am i doing", "what is my current activity", "current task"
+    activity_keywords = [
+        "working on", "what am i doing", "what is my activity", "whats my activity",
+        "current activity", "current task", "current context", "active activity",
+        "active task", "what are you seeing", "what do you see", "what is my context",
+        "whats my context", "what am i on", "what am i doing right now",
+    ]
+    is_activity_q = any(kw in q_clean for kw in activity_keywords) or (
+        any(w in q_clean for w in ["activity", "task", "working", "doing"])
+        and any(w in q_clean for w in ["current", "active", "right now", "now", "present"])
+    )
+
+    if is_activity_q:
+        act = current_context.activity if current_context else None
+        win = current_context.window_title if current_context else None
+        if act and act.strip() and act.strip().lower() not in ("none", "no active context", "unknown", "idle", "no_activity"):
+            dur_sec = max(0.0, now - context_start_time) if context_start_time else 0.0
+            dur_str = f" for {format_duration(dur_sec)}" if dur_sec > 0 else ""
+            win_str = f" in '{win.strip()}'" if (win and win.strip().lower() not in ("none", "unknown")) else ""
+            interp_str = ""
+            if understanding and understanding.interpretation and understanding.pattern_type not in ("no_activity", "unknown"):
+                interp_str = f" Pattern: {understanding.interpretation}."
+            return f"You are currently working on {act.strip()}{win_str}{dur_str}.{interp_str}"
+        return "No active desktop activity or context is currently detected."
+
+    # 4. Recent history / Activity flow questions
+    # e.g., "what was i doing recently", "what did i do before this", "recent activity", "recent history"
+    history_keywords = [
+        "recently", "recent activity", "recent history", "what was i doing",
+        "what did i do", "doing earlier", "before this", "before that",
+        "previous activity", "previous window", "previous task", "earlier today",
+        "activity flow", "past activity", "what have i done",
+    ]
+    is_history_q = any(kw in q_clean for kw in history_keywords) or (
+        any(w in q_clean for w in ["recent", "recently", "previous", "earlier", "before", "history", "flow"])
+        and any(w in q_clean for w in ["activity", "activities", "doing", "task", "window", "work", "history"])
+    )
+
+    if is_history_q:
+        episodes = history.get_recent(limit=5) if history else []
+        if episodes:
+            lines = ["Recent activity history:"]
+            for idx, ep in enumerate(episodes, 1):
+                dur_str = format_duration(ep.duration) if ep.duration else "brief"
+                win_str = f" on '{ep.window_title}'" if ep.window_title else ""
+                lines.append(f"  {idx}. {ep.activity}{win_str} ({dur_str})")
+            if understanding and understanding.recent_activities and len(understanding.recent_activities) > 1:
+                flow_str = " -> ".join(understanding.recent_activities)
+                lines.append(f"Flow: {flow_str}")
+            return "\n".join(lines)
+        return "No recent activity history has been recorded yet in this session."
+
+    # 5. General context overview / status
+    context_keywords = ["desktop context", "my context", "system status", "workspace status"]
+    if any(kw in q_clean for kw in context_keywords) or q_clean in ("context", "status"):
+        act = current_context.activity if current_context else None
+        win = current_context.window_title if current_context else None
+        if (act and act.strip().lower() not in ("none", "unknown")) or (win and win.strip().lower() not in ("none", "unknown")):
+            dur_sec = max(0.0, now - context_start_time) if context_start_time else 0.0
+            return f"Active Context: {act or 'general activity'} on '{win or 'desktop'}' ({format_duration(dur_sec)})."
+        return "No active desktop context is currently detected."
+
+    return None
+
+
 class CompanionAI:
     """
     Context-aware AI Companion Core that answers user queries using
@@ -538,6 +746,57 @@ class CompanionAI:
     def execute_tool(self, name: str, **kwargs) -> ToolResult:
         """Execute a tool by name using the companion's ToolRegistry."""
         return self.tools.execute(name, **kwargs)
+
+    def deterministic_local_answer(
+        self,
+        user_query: str,
+        current_context: Optional[DesktopContext],
+        context_start_time: Optional[float],
+        history: Optional[ContextHistory],
+        understanding: Optional[WorkflowUnderstanding],
+        now: Optional[float] = None,
+    ) -> Optional[str]:
+        """Compute a deterministic local answer for basic desktop context questions."""
+        return deterministic_local_answer(
+            user_query=user_query,
+            current_context=current_context,
+            context_start_time=context_start_time,
+            history=history,
+            understanding=understanding,
+            now=now,
+        )
+
+    def _handle_quota_exhaustion(
+        self,
+        e: Exception,
+        user_query: str,
+        current_context: Optional[DesktopContext],
+        context_start_time: Optional[float],
+        history: Optional[ContextHistory],
+        understanding: Optional[WorkflowUnderstanding],
+        active_session: ConversationSession,
+        now: Optional[float] = None,
+    ) -> str:
+        """Handle quota exhaustion with deterministic local context fallback."""
+        local_ans = self.deterministic_local_answer(
+            user_query=user_query,
+            current_context=current_context,
+            context_start_time=context_start_time,
+            history=history,
+            understanding=understanding,
+            now=now,
+        )
+        if local_ans:
+            response = f"[Local Fallback — Gemini Quota Exceeded]\n{local_ans}"
+        else:
+            response = (
+                "[Gemini Quota Exceeded] Gemini API rate limit or quota exceeded (HTTP 429). "
+                "The online AI model is currently unavailable, and this question "
+                "cannot be answered using local desktop perception."
+            )
+        active_session.add_user_message(user_query)
+        active_session.add_assistant_message(response)
+        return response
 
     def ask(
         self,
@@ -585,9 +844,32 @@ class CompanionAI:
             active_session.add_user_message(user_query)
             active_session.add_assistant_message(response)
             return response
+        except QuotaExceededError as e:
+            return self._handle_quota_exhaustion(
+                e=e,
+                user_query=user_query,
+                current_context=current_context,
+                context_start_time=context_start_time,
+                history=history,
+                understanding=understanding,
+                active_session=active_session,
+                now=now,
+            )
         except MissingAPIKeyError as e:
             return str(e)
         except LLMProviderError as e:
+            err_str = str(e).lower()
+            if "429" in err_str and ("rate limit" in err_str or "quota" in err_str or "too many requests" in err_str or "resource_exhausted" in err_str):
+                return self._handle_quota_exhaustion(
+                    e=e,
+                    user_query=user_query,
+                    current_context=current_context,
+                    context_start_time=context_start_time,
+                    history=history,
+                    understanding=understanding,
+                    active_session=active_session,
+                    now=now,
+                )
             return f"[AI Provider Error] {e}"
         except Exception as e:
             return f"[AI Error] An unexpected error occurred: {e}"

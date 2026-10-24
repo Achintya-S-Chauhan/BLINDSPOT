@@ -15,6 +15,8 @@ from ai import (
     CompanionAI,
     MissingAPIKeyError,
     LLMProviderError,
+    QuotaExceededError,
+    deterministic_local_answer,
     ToolCall,
     parse_tool_calls,
     extract_text_response,
@@ -643,6 +645,344 @@ class TestAICompanionCore(unittest.TestCase):
 
             self.assertIn("[AI Provider Error]", reply)
             self.assertEqual(len(ai.conversation), 0)
+
+    def test_26_gemini_provider_http_429_raises_quota_exceeded_error(self):
+        """26. Test that HTTP 429 parses error cleanly, redacts API key, and raises QuotaExceededError."""
+        from urllib.error import HTTPError
+        import urllib.request
+
+        secret_key = "super_secret_gemini_api_key_12345"
+        provider = GeminiProvider(api_key=secret_key)
+
+        raw_json = json.dumps({
+            "error": {
+                "code": 429,
+                "message": f"Rate limit exceeded for model gemini-3.6-flash (key: {secret_key})",
+                "status": "RESOURCE_EXHAUSTED",
+            }
+        }).encode("utf-8")
+
+        mock_http_err = HTTPError(
+            url=f"https://generativelanguage.googleapis.com/v1beta/interactions?key={secret_key}",
+            code=429,
+            msg="Too Many Requests",
+            hdrs={},
+            fp=io.BytesIO(raw_json),
+        )
+
+        with patch("urllib.request.urlopen", side_effect=mock_http_err):
+            with self.assertRaises(QuotaExceededError) as cm:
+                provider._send_http_request({"model": "gemini-3.6-flash"}, secret_key)
+
+            err_msg = str(cm.exception)
+            self.assertIn("429", err_msg)
+            self.assertIn("quota", err_msg.lower())
+            # API secret must never be exposed
+            self.assertNotIn(secret_key, err_msg)
+            # Raw provider JSON wrapper must not be dumped directly
+            self.assertNotIn('"status": "RESOURCE_EXHAUSTED"', err_msg)
+
+    def test_27_deterministic_local_answer_active_window(self):
+        """27. Test deterministic local fallback answering active window queries."""
+        ctx = self._create_context("coding", "VSCode - main.py")
+        ans = deterministic_local_answer(
+            user_query="What window is active?",
+            current_context=ctx,
+            context_start_time=1000.0,
+            history=None,
+            understanding=None,
+            now=1045.0,
+        )
+        self.assertIsNotNone(ans)
+        self.assertIn("VSCode - main.py", ans)
+        self.assertIn("active for 45s", ans)
+
+    def test_28_deterministic_local_answer_working_on(self):
+        """28. Test deterministic local fallback answering 'what am I working on' queries."""
+        ctx = self._create_context("coding", "VSCode - main.py")
+        history = ContextHistory()
+        understanding = self.analyzer.analyze(ctx, 1000.0, history, now=1030.0)
+
+        ans = deterministic_local_answer(
+            user_query="What am I working on?",
+            current_context=ctx,
+            context_start_time=1000.0,
+            history=history,
+            understanding=understanding,
+            now=1030.0,
+        )
+        self.assertIsNotNone(ans)
+        self.assertIn("coding", ans)
+        self.assertIn("VSCode - main.py", ans)
+
+    def test_29_deterministic_local_answer_recent_activity(self):
+        """29. Test deterministic local fallback answering recent activity history queries."""
+        history = ContextHistory()
+        c1 = self._create_context("researching in browser", "Chrome")
+        c2 = self._create_context("coding", "VSCode")
+        history.record_transition(c1, 1000.0, 1060.0)
+        history.record_transition(c2, 1060.0, 1120.0)
+
+        understanding = self.analyzer.analyze(c2, 1120.0, history, now=1130.0)
+
+        ans = deterministic_local_answer(
+            user_query="What was I doing recently?",
+            current_context=c2,
+            context_start_time=1120.0,
+            history=history,
+            understanding=understanding,
+            now=1130.0,
+        )
+        self.assertIsNotNone(ans)
+        self.assertIn("Recent activity history", ans)
+        self.assertIn("researching in browser", ans)
+        self.assertIn("coding", ans)
+
+    def test_30_deterministic_local_answer_missing_context_honesty(self):
+        """30. Test that missing context honestly reports unavailable rather than fabricating."""
+        # 1. Missing window
+        ans_win = deterministic_local_answer(
+            user_query="What window is active?",
+            current_context=None,
+            context_start_time=None,
+            history=None,
+            understanding=None,
+        )
+        self.assertEqual(ans_win, "No active window is currently detected.")
+
+        # 2. Missing activity
+        ans_act = deterministic_local_answer(
+            user_query="What am I working on?",
+            current_context=None,
+            context_start_time=None,
+            history=None,
+            understanding=None,
+        )
+        self.assertEqual(ans_act, "No active desktop activity or context is currently detected.")
+
+        # 3. Empty history
+        empty_hist = ContextHistory()
+        ans_hist = deterministic_local_answer(
+            user_query="What was I doing recently?",
+            current_context=None,
+            context_start_time=None,
+            history=empty_hist,
+            understanding=None,
+        )
+        self.assertEqual(ans_hist, "No recent activity history has been recorded yet in this session.")
+
+    def test_31_deterministic_local_answer_unrelated_query_returns_none(self):
+        """31. Test that non-context questions return None so they are not fabricated locally."""
+        ans = deterministic_local_answer(
+            user_query="Write a poem about rust and python",
+            current_context=self._create_context("coding"),
+            context_start_time=1000.0,
+            history=None,
+            understanding=None,
+        )
+        self.assertIsNone(ans)
+
+    def test_32_companion_ai_ask_quota_exceeded_local_fallback(self):
+        """32. Test that QuotaExceededError in CompanionAI.ask triggers local fallback and records turn."""
+        provider = MockLLMProvider(should_raise=QuotaExceededError("Rate limit exceeded (HTTP 429)"))
+        ai = CompanionAI(provider=provider)
+
+        ctx = self._create_context("coding", "VSCode - task.py")
+        history = ContextHistory()
+        understanding = self.analyzer.analyze(ctx, 1000.0, history, now=1020.0)
+
+        reply = ai.ask(
+            current_context=ctx,
+            context_start_time=1000.0,
+            history=history,
+            understanding=understanding,
+            user_query="What am I working on?",
+            now=1020.0,
+        )
+
+        self.assertIn("[Local Fallback — Gemini Quota Exceeded]", reply)
+        self.assertIn("coding", reply)
+        self.assertIn("VSCode - task.py", reply)
+
+        # Conversation session records the turn
+        turns = ai.conversation.get_turns()
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0].content, "What am I working on?")
+        self.assertIn("[Local Fallback — Gemini Quota Exceeded]", turns[1].content)
+
+    def test_33_companion_ai_ask_quota_exceeded_unrelated_query(self):
+        """33. Test QuotaExceededError on non-context query returns concise friendly message without raw JSON."""
+        provider = MockLLMProvider(should_raise=QuotaExceededError("Rate limit exceeded (HTTP 429)"))
+        ai = CompanionAI(provider=provider)
+
+        ctx = self._create_context("coding")
+        history = ContextHistory()
+        understanding = self.analyzer.analyze(ctx, 1000.0, history, now=1010.0)
+
+        reply = ai.ask(
+            current_context=ctx,
+            context_start_time=1000.0,
+            history=history,
+            understanding=understanding,
+            user_query="How do I configure nginx reverse proxy?",
+            now=1010.0,
+        )
+
+        self.assertIn("[Gemini Quota Exceeded]", reply)
+        self.assertIn("HTTP 429", reply)
+        self.assertNotIn("{", reply)  # No raw JSON
+        self.assertNotIn("RESOURCE_EXHAUSTED", reply)
+
+        # Conversation turn recorded
+        turns = ai.conversation.get_turns()
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0].content, "How do I configure nginx reverse proxy?")
+
+    def test_34_deterministic_local_answer_summary_short_and_natural_language(self):
+        """34. Test summary requests with short commands and natural-language phrasings."""
+        history = ContextHistory()
+        c1 = self._create_context("researching in browser", "Chrome")
+        c2 = self._create_context("coding", "VSCode - main.py")
+        history.record_transition(c1, 1000.0, 1060.0)
+        history.record_transition(c2, 1060.0, 1120.0)
+        understanding = self.analyzer.analyze(c2, 1120.0, history, now=1180.0)
+
+        test_queries = [
+            "summary",
+            "summarize my activity",
+            "give me a desktop summary",
+            "summarize what I've been doing",
+            "can you summarize what I've been doing?",
+            "desktop summary",
+            "activity summary",
+            "give me a summary",
+        ]
+
+        for q in test_queries:
+            ans = deterministic_local_answer(
+                user_query=q,
+                current_context=c2,
+                context_start_time=1120.0,
+                history=history,
+                understanding=understanding,
+                now=1180.0,
+            )
+            self.assertIsNotNone(ans, f"Expected non-None response for query '{q}'")
+            self.assertIn("Desktop Activity Summary:", ans)
+            self.assertIn("coding", ans)
+            self.assertIn("VSCode - main.py", ans)
+            self.assertIn("active for 1m", ans)
+            self.assertIn("Recent Activity (2 recorded episodes):", ans)
+            self.assertIn("researching in browser on 'Chrome'", ans)
+            self.assertIn("Flow: researching in browser -> coding", ans)
+
+    def test_35_deterministic_local_answer_summary_empty_history(self):
+        """35. Test summary when current context exists but no prior history has been recorded."""
+        ctx = self._create_context("debugging", "PyCharm - test_core.py")
+        empty_hist = ContextHistory()
+
+        ans = deterministic_local_answer(
+            user_query="summary",
+            current_context=ctx,
+            context_start_time=1000.0,
+            history=empty_hist,
+            understanding=None,
+            now=1045.0,
+        )
+        self.assertIsNotNone(ans)
+        self.assertIn("Desktop Activity Summary:", ans)
+        self.assertIn("Current Focus: debugging in 'PyCharm - test_core.py' (active for 45s).", ans)
+        self.assertIn("Recent History: No prior activity transitions recorded yet in this session.", ans)
+
+    def test_36_deterministic_local_answer_summary_missing_current_context(self):
+        """36. Test summary when no current window is active but prior history exists."""
+        history = ContextHistory()
+        c1 = self._create_context("writing documentation", "Notion")
+        c2 = self._create_context("terminal ops", "PowerShell")
+        history.record_transition(c1, 1000.0, 1100.0)
+        history.record_transition(c2, 1100.0, 1200.0)
+        understanding = self.analyzer.analyze(c2, 1200.0, history, now=1210.0)
+
+        ans = deterministic_local_answer(
+            user_query="give me a desktop summary",
+            current_context=None,
+            context_start_time=None,
+            history=history,
+            understanding=understanding,
+            now=1210.0,
+        )
+        self.assertIsNotNone(ans)
+        self.assertIn("Desktop Activity Summary:", ans)
+        self.assertIn("Current Focus: No active window or activity currently detected.", ans)
+        self.assertIn("Recent Activity (2 recorded episodes):", ans)
+        self.assertIn("writing documentation on 'Notion'", ans)
+        self.assertIn("terminal ops on 'PowerShell'", ans)
+
+    def test_37_deterministic_local_answer_summary_no_activity_honesty(self):
+        """37. Test that summary honestly reports not enough recorded activity when context and history are absent."""
+        empty_hist = ContextHistory()
+        ans = deterministic_local_answer(
+            user_query="summarize what I've been doing",
+            current_context=None,
+            context_start_time=None,
+            history=empty_hist,
+            understanding=None,
+        )
+        self.assertEqual(ans, "There is not enough recorded desktop activity or history to summarize.")
+
+    def test_38_deterministic_local_answer_summary_unrelated_query_returns_none(self):
+        """38. Test that unrelated queries with 'summary' words return None and do not trigger desktop summary."""
+        ctx = self._create_context("coding", "VSCode")
+        history = ContextHistory()
+        unrelated_queries = [
+            "Write a summary of Hamlet",
+            "Summarize the French Revolution",
+            "Please summarize this PDF article about quantum computing",
+            "Summary of War and Peace",
+        ]
+        for q in unrelated_queries:
+            ans = deterministic_local_answer(
+                user_query=q,
+                current_context=ctx,
+                context_start_time=1000.0,
+                history=history,
+                understanding=None,
+            )
+            self.assertIsNone(ans, f"Expected None for unrelated query '{q}' but got: {ans}")
+
+    def test_39_companion_ai_ask_quota_exceeded_summary_fallback(self):
+        """39. Test that summary query on QuotaExceededError in CompanionAI returns local summary fallback."""
+        provider = MockLLMProvider(should_raise=QuotaExceededError("Rate limit exceeded (HTTP 429)"))
+        ai = CompanionAI(provider=provider)
+
+        ctx = self._create_context("coding", "VSCode - verification.py")
+        history = ContextHistory()
+        c1 = self._create_context("terminal testing", "Command Prompt")
+        history.record_transition(c1, 1000.0, 1050.0)
+        history.record_transition(ctx, 1050.0, 1100.0)
+
+        understanding = self.analyzer.analyze(ctx, 1100.0, history, now=1130.0)
+
+        reply = ai.ask(
+            current_context=ctx,
+            context_start_time=1100.0,
+            history=history,
+            understanding=understanding,
+            user_query="summary",
+            now=1130.0,
+        )
+
+        self.assertIn("[Local Fallback — Gemini Quota Exceeded]", reply)
+        self.assertIn("Desktop Activity Summary:", reply)
+        self.assertIn("coding in 'VSCode - verification.py'", reply)
+        self.assertIn("Recent Activity", reply)
+        self.assertIn("terminal testing on 'Command Prompt'", reply)
+
+        # Check conversation history recorded correctly
+        turns = ai.conversation.get_turns()
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0].content, "summary")
+        self.assertIn("Desktop Activity Summary:", turns[1].content)
 
 
 if __name__ == "__main__":

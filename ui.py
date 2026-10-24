@@ -12,6 +12,7 @@ Provides:
 import sys
 import time
 import threading
+import queue
 from typing import Dict, Any, Optional, Callable, List
 
 import tkinter as tk
@@ -35,13 +36,14 @@ from tools import (
 )
 from verification import VerificationStatus
 from recovery import RecoveryRecord, FailureType, RecoveryDecision
+from understanding import ContextualUnderstandingAnalyzer
 from main import format_time
 
 
 class UIStateBridge:
     """
     Thread-safe bridge between BLINDSPOT backend state, task planning,
-    and controlled task execution.
+    controlled task execution, and companion chat Q&A.
     Decoupled from Tk widgets to allow full headless testing.
     """
 
@@ -54,6 +56,7 @@ class UIStateBridge:
         task_executor: Optional[Any] = None,
         action_approver: Optional[Callable[[ActionRequest], bool]] = None,
         desktop_io: Optional[Any] = None,
+        analyzer: Optional[Any] = None,
     ):
         self.state = state
         self.state_lock = state_lock
@@ -62,6 +65,7 @@ class UIStateBridge:
         self.task_executor = task_executor
         self.action_approver = action_approver
         self.desktop_io = desktop_io or (state.get("desktop_io") if state else None)
+        self.analyzer = analyzer if analyzer is not None else ContextualUnderstandingAnalyzer()
 
         # Phase 8B Task & Execution state
         self.pending_task: Optional[Task] = None
@@ -70,8 +74,87 @@ class UIStateBridge:
         self.is_executing: bool = False
         self.last_execution_summary: Optional[TaskExecutionSummary] = None
 
+        # Phase 9A Companion Chat state
+        self.is_asking: bool = False
+
         if action_approver and self.tool_registry and hasattr(self.tool_registry, "_policy"):
             self.tool_registry._policy.set_approver(ActionRisk.LOW_RISK_ACTION, action_approver)
+
+    def ask(self, query: str) -> Dict[str, Any]:
+        """
+        Ask a natural-language question about current desktop context.
+        Reuses CompanionAI.ask() and the exact context wiring from the CLI.
+        Guards against duplicate submissions.
+        """
+        if self.is_asking:
+            return {
+                "success": False,
+                "error": "A conversational query is already in progress. Please wait.",
+            }
+
+        q_clean = query.strip()
+        if not q_clean:
+            return {
+                "success": False,
+                "error": "Question cannot be empty.",
+            }
+
+        if self.companion_ai is None:
+            return {
+                "success": False,
+                "error": "Companion AI is not configured. Q&A unavailable.",
+            }
+
+        self.is_asking = True
+        try:
+            now = time.time()
+            with self.state_lock:
+                cur_ctx = self.state.get("current_context")
+                start_time = self.state.get("context_start_time")
+                hist = self.state.get("history")
+                if self.analyzer is not None:
+                    understanding = self.analyzer.analyze(
+                        current_context=cur_ctx,
+                        context_start_time=start_time,
+                        history=hist,
+                        now=now,
+                    )
+                else:
+                    understanding = None
+
+            answer = self.companion_ai.ask(
+                current_context=cur_ctx,
+                context_start_time=start_time,
+                history=hist,
+                understanding=understanding,
+                user_query=q_clean,
+                now=now,
+            )
+            return {
+                "success": True,
+                "query": q_clean,
+                "answer": answer,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"AI Q&A error: {str(e)}",
+            }
+        finally:
+            self.is_asking = False
+
+    def clear_conversation(self) -> None:
+        """Reset the active conversation session history."""
+        if self.companion_ai is not None and hasattr(self.companion_ai, "clear_conversation"):
+            self.companion_ai.clear_conversation()
+
+    def get_conversation_turns(self) -> List[Dict[str, Any]]:
+        """Return serialized list of recorded conversation turns."""
+        if self.companion_ai is not None and hasattr(self.companion_ai, "conversation"):
+            conv = self.companion_ai.conversation
+            if conv is not None and hasattr(conv, "get_history_dicts"):
+                return conv.get_history_dicts()
+        return []
 
     def set_action_approver(self, approver: Callable[[ActionRequest], bool]) -> None:
         """Register a runtime callback for LOW_RISK_ACTION approval."""
@@ -345,6 +428,9 @@ class BlindspotMainWindow:
         self._approval_lock = threading.Lock()
         self._on_approval_waiting: Optional[Callable[[], None]] = None
         self._last_plan_res: Optional[Dict[str, Any]] = None
+        self._is_chat_busy: bool = False
+        self._active_chat_worker: Optional[threading.Thread] = None
+        self._ui_queue: queue.Queue = queue.Queue()
 
         self.desktop_io = getattr(bridge, "desktop_io", None)
         if self.desktop_io is None and bridge.state:
@@ -373,14 +459,15 @@ class BlindspotMainWindow:
 
     def _init_window(self) -> None:
         self.root.title("BLINDSPOT — Desktop Assistant")
-        self.root.geometry("780x660")
-        self.root.minsize(680, 520)
+        self.root.geometry("780x700")
+        self.root.minsize(680, 560)
         self.root.configure(bg=self.BG_DARK)
 
     def _setup_styles(self) -> None:
         style = ttk.Style(self.root)
         try:
-            style.theme_use("clam")
+            if style.theme_use() != "clam":
+                style.theme_use("clam")
         except Exception:
             pass
 
@@ -449,6 +536,26 @@ class BlindspotMainWindow:
             background=self.BG_DARK,
             foreground=self.COLOR_STOPPED,
             font=("Segoe UI", 9, "bold"),
+        )
+
+        # Tabbed notebook styling (Phase 9A)
+        style.configure(
+            "TNotebook",
+            background=self.BG_DARK,
+            borderwidth=0,
+        )
+        style.configure(
+            "TNotebook.Tab",
+            background=self.CARD_BG,
+            foreground=self.FG_MUTED,
+            padding=[14, 6],
+            font=("Segoe UI", 9, "bold"),
+            borderwidth=0,
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", self.CARD_BG), ("active", "#2d334a")],
+            foreground=[("selected", self.ACCENT_BLUE), ("active", self.FG_MAIN)],
         )
 
     def _build_widgets(self) -> None:
@@ -527,9 +634,16 @@ class BlindspotMainWindow:
         self.val_duration = ttk.Label(grid_frame, text="0s", style="FieldValue.TLabel")
         self.val_duration.grid(row=3, column=1, sticky=tk.W, pady=2)
 
-        # ---------------- TASK PLANNING & EXECUTION CARD (PHASE 8B) ----------------
-        task_card = ttk.Frame(main_container, style="Card.TFrame", padding=12)
-        task_card.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        # ---------------- TABBED INTERACTIVE INTERFACE (PHASE 9A) ----------------
+        self.notebook = ttk.Notebook(main_container)
+        self.notebook.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        # Tab 1: Task Planning & Execution
+        task_tab = ttk.Frame(self.notebook, style="Root.TFrame")
+        self.notebook.add(task_tab, text="Task Planning & Execution")
+
+        task_card = ttk.Frame(task_tab, style="Card.TFrame", padding=12)
+        task_card.pack(fill=tk.BOTH, expand=True)
 
         ttk.Label(task_card, text="TASK PLANNING & CONTROLLED EXECUTION", style="CardHeader.TLabel").pack(
             anchor=tk.W, pady=(0, 2)
@@ -590,6 +704,75 @@ class BlindspotMainWindow:
             "Execution requires two-stage explicit confirmation: Plan Task -> Approve Plan -> Execute Task.\n"
         )
         self.plan_output.configure(state="disabled")
+
+        # Tab 2: Companion Chat & Desktop Q&A (Phase 9A)
+        chat_tab = ttk.Frame(self.notebook, style="Root.TFrame")
+        self.notebook.add(chat_tab, text="Companion Chat & Q&A")
+
+        chat_card = ttk.Frame(chat_tab, style="Card.TFrame", padding=12)
+        chat_card.pack(fill=tk.BOTH, expand=True)
+
+        chat_header = ttk.Frame(chat_card, style="Card.TFrame")
+        chat_header.pack(fill=tk.X, pady=(0, 2))
+
+        ttk.Label(chat_header, text="COMPANION CHAT & DESKTOP Q&A", style="CardHeader.TLabel").pack(
+            side=tk.LEFT, anchor=tk.W
+        )
+        self.clear_chat_btn = ttk.Button(
+            chat_header,
+            text="Clear Chat",
+            command=self._on_clear_chat_clicked,
+        )
+        self.clear_chat_btn.pack(side=tk.RIGHT)
+
+        ttk.Label(
+            chat_card,
+            text="Ask natural-language questions about your current desktop context, active applications, or recent activity.",
+            style="FieldValue.TLabel",
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        # Chat output text area
+        self.chat_output = scrolledtext.ScrolledText(
+            chat_card,
+            height=12,
+            bg="#181825",
+            fg="#c0caf5",
+            insertbackground="#c0caf5",
+            font=("Consolas", 9),
+            relief="flat",
+            borderwidth=1,
+            wrap=tk.WORD,
+        )
+        self.chat_output.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        # Text tags for distinct role styling
+        self.chat_output.tag_config("user", foreground="#7aa2f7", font=("Consolas", 9, "bold"))
+        self.chat_output.tag_config("assistant", foreground="#9ece6a", font=("Consolas", 9))
+        self.chat_output.tag_config("system", foreground="#bb9af7", font=("Consolas", 9, "italic"))
+        self.chat_output.tag_config("error", foreground="#f7768e", font=("Consolas", 9, "bold"))
+        self.chat_output.tag_config("time", foreground="#7982a9", font=("Consolas", 8))
+
+        # Initial informational prompt
+        self._append_chat_message(
+            "SYSTEM",
+            "Welcome to BLINDSPOT Companion Chat!\nAsk questions about your current desktop context (e.g. 'What am I working on?', 'What was I doing recently?').",
+            tag="system",
+        )
+
+        # Chat input row
+        chat_input_row = ttk.Frame(chat_card, style="Card.TFrame")
+        chat_input_row.pack(fill=tk.X)
+
+        self.chat_entry = ttk.Entry(chat_input_row)
+        self.chat_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        self.chat_entry.bind("<Return>", self._on_chat_return)
+
+        self.send_chat_btn = ttk.Button(
+            chat_input_row,
+            text="Send",
+            command=self._on_send_chat_clicked,
+        )
+        self.send_chat_btn.pack(side=tk.LEFT)
 
         # ---------------- FOOTER / STATUS BAR ----------------
         footer_frame = ttk.Frame(main_container, style="Root.TFrame")
@@ -720,6 +903,31 @@ class BlindspotMainWindow:
         if not self._is_destroyed:
             self.footer_label.configure(text=f"Error: {error_message}", style="Error.TLabel")
 
+    def _safe_ui_dispatch(self, callback: Callable[[], None]) -> None:
+        """Safely schedule a callback on the UI thread."""
+        with self._approval_lock:
+            if self._is_destroyed:
+                return
+            self._ui_queue.put(callback)
+            if self.root and threading.current_thread() == threading.main_thread():
+                try:
+                    self.root.after(0, self._process_ui_queue)
+                except Exception:
+                    pass
+
+    def _process_ui_queue(self) -> None:
+        """Process any pending UI callbacks on the Tkinter main thread."""
+        if self._is_destroyed:
+            return
+        while not self._ui_queue.empty():
+            try:
+                cb = self._ui_queue.get_nowait()
+                cb()
+            except queue.Empty:
+                break
+            except Exception:
+                pass
+
     def _schedule_poll(self) -> None:
         """Schedule next background poll."""
         if not self._is_destroyed:
@@ -728,6 +936,7 @@ class BlindspotMainWindow:
     def _on_poll(self) -> None:
         if self._is_destroyed:
             return
+        self._process_ui_queue()
         self._refresh_view()
         self._schedule_poll()
 
@@ -795,12 +1004,7 @@ class BlindspotMainWindow:
             except Exception as e:
                 res = {"success": False, "error": f"Unexpected planning error: {str(e)}"}
 
-            # Safely schedule update on UI thread using after(0, ...)
-            if not self._is_destroyed:
-                try:
-                    self.root.after(0, lambda: self._handle_plan_result(res))
-                except Exception:
-                    pass
+            self._safe_ui_dispatch(lambda: self._handle_plan_result(res))
 
         self._active_worker = threading.Thread(target=_worker, daemon=True)
         self._active_worker.start()
@@ -936,11 +1140,7 @@ class BlindspotMainWindow:
             except Exception as e:
                 res = {"success": False, "error": f"Unexpected execution error: {str(e)}"}
 
-            if not self._is_destroyed:
-                try:
-                    self.root.after(0, lambda: self._handle_execution_result(res))
-                except Exception:
-                    pass
+            self._safe_ui_dispatch(lambda: self._handle_execution_result(res))
 
         self._active_worker = threading.Thread(target=_worker, daemon=True)
         self._active_worker.start()
@@ -1051,23 +1251,155 @@ class BlindspotMainWindow:
         self.plan_output.insert(tk.END, text)
         self.plan_output.configure(state="disabled")
 
+    # ---------------- COMPANION CHAT METHODS (PHASE 9A) ----------------
+
+    def _append_chat_message(self, sender: str, text: str, tag: str = "assistant") -> None:
+        """Safely append a message to the conversation display."""
+        if self._is_destroyed:
+            return
+        self.chat_output.configure(state="normal")
+        timestamp_str = time.strftime("[%H:%M:%S] ")
+        self.chat_output.insert(tk.END, timestamp_str, "time")
+        sender_tag = tag if tag in ("user", "assistant", "system", "error") else ("user" if sender.lower() == "user" else "assistant")
+        self.chat_output.insert(tk.END, f"{sender}: ", sender_tag)
+        self.chat_output.insert(tk.END, f"{text}\n\n", tag)
+        self.chat_output.see(tk.END)
+        self.chat_output.configure(state="disabled")
+
+    def _on_send_chat_clicked(self) -> None:
+        """Handle sending chat query to Companion AI."""
+        if self._is_chat_busy:
+            return
+
+        query = self.chat_entry.get().strip()
+        if not query:
+            return
+
+        self._is_chat_busy = True
+        self.chat_entry.delete(0, tk.END)
+        self.chat_entry.configure(state="disabled")
+        self.send_chat_btn.configure(state="disabled")
+        self.clear_chat_btn.configure(state="disabled")
+
+        self._append_chat_message("User", query, tag="user")
+        self.set_status_message("BLINDSPOT is thinking...")
+
+        def _worker():
+            import gc
+            gc_was_enabled = gc.isenabled()
+            if gc_was_enabled:
+                gc.disable()
+            try:
+                res = self.bridge.ask(query)
+            except Exception as e:
+                res = {"success": False, "error": f"Unexpected chat error: {str(e)}"}
+            finally:
+                if gc_was_enabled:
+                    gc.enable()
+
+            self._safe_ui_dispatch(lambda: self._handle_chat_response(res))
+
+        self._active_chat_worker = threading.Thread(target=_worker, daemon=True)
+        self._active_chat_worker.start()
+
+    def _on_chat_return(self, event=None) -> None:
+        """Handle Return key press in chat entry."""
+        self._on_send_chat_clicked()
+
+    def _handle_chat_response(self, res: Dict[str, Any]) -> None:
+        """Process chat response on UI thread and restore controls."""
+        if self._is_destroyed:
+            return
+
+        try:
+            if res.get("success"):
+                answer = res.get("answer", "")
+                if "[Local Fallback" in answer or "[Gemini Quota Exceeded]" in answer:
+                    self._append_chat_message("BLINDSPOT (Local Fallback)", answer, tag="assistant")
+                    self.set_status_message("Notice: Gemini quota exceeded. Local fallback active.")
+                else:
+                    self._append_chat_message("BLINDSPOT", answer, tag="assistant")
+                    self.set_status_message("BLINDSPOT replied.")
+            else:
+                err = res.get("error", "Unknown error")
+                err_lower = err.lower()
+                if "429" in err_lower or "quota" in err_lower or "resource_exhausted" in err_lower:
+                    clean_err = "Gemini API daily quota or rate limit exceeded (HTTP 429)."
+                else:
+                    clean_err = err
+                self._append_chat_message("ERROR", clean_err, tag="error")
+                self.set_status_error(f"Chat error: {clean_err}")
+        finally:
+            self._is_chat_busy = False
+            try:
+                self.chat_entry.configure(state="normal")
+                self.send_chat_btn.configure(state="normal")
+                self.clear_chat_btn.configure(state="normal")
+                self.chat_entry.focus()
+            except Exception:
+                pass
+
+    def _on_clear_chat_clicked(self) -> None:
+        """Clear conversation session and chat display."""
+        if self._is_chat_busy:
+            return
+        self.bridge.clear_conversation()
+        if not self._is_destroyed:
+            self.chat_output.configure(state="normal")
+            self.chat_output.delete("1.0", tk.END)
+            self.chat_output.configure(state="disabled")
+            self._append_chat_message(
+                "SYSTEM",
+                "Conversation history cleared.",
+                tag="system",
+            )
+            self.set_status_message("Conversation history cleared.")
+
     def on_close(self) -> None:
         """Clean shutdown handler."""
         with self._approval_lock:
+            if self._is_destroyed:
+                return
             self._is_destroyed = True
             if self._active_approval_event is not None:
                 self._active_approval_event.set()
                 self._active_approval_event = None
 
-        if self._poll_job is not None:
+        self._is_chat_busy = False
+
+        if self._poll_job is not None and self.root:
             try:
                 self.root.after_cancel(self._poll_job)
             except Exception:
                 pass
             self._poll_job = None
 
+        # Join any active background worker threads before tearing down Tkinter
+        if self._active_chat_worker is not None and self._active_chat_worker.is_alive():
+            try:
+                self._active_chat_worker.join(timeout=3.0)
+            except Exception:
+                pass
+
+        if self._active_worker is not None and self._active_worker.is_alive():
+            try:
+                self._active_worker.join(timeout=4.0)
+            except Exception:
+                pass
+
+        try:
+            self.root.update_idletasks()
+        except Exception:
+            pass
+
         try:
             self.root.destroy()
+        except Exception:
+            pass
+
+        try:
+            import gc
+            gc.collect()
         except Exception:
             pass
 
@@ -1080,6 +1412,7 @@ def run_ui(
     task_executor: Optional[Any] = None,
     action_approver: Optional[Callable[[ActionRequest], bool]] = None,
     desktop_io: Optional[Any] = None,
+    analyzer: Optional[Any] = None,
 ) -> None:
     """Launch the BLINDSPOT desktop window."""
     bridge = UIStateBridge(
@@ -1090,6 +1423,7 @@ def run_ui(
         task_executor=task_executor,
         action_approver=action_approver,
         desktop_io=desktop_io,
+        analyzer=analyzer,
     )
     root = tk.Tk()
     BlindspotMainWindow(root=root, bridge=bridge, action_approver=action_approver)
@@ -1123,6 +1457,7 @@ def main():
             tool_registry=components["tool_registry"],
             task_executor=components["task_executor"],
             desktop_io=desktop_io,
+            analyzer=components.get("analyzer"),
         )
     finally:
         stop_event.set()
