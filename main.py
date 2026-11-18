@@ -53,10 +53,13 @@ def format_timestamp(timestamp):
 
 def close_active_context(state, now):
     """Close the ongoing context, update cumulative activity time, and record into history."""
-    if state["last_context"] and state["context_start_time"]:
+    if not isinstance(state, dict):
+        return
+    if state.get("last_context") and state.get("context_start_time"):
         duration = now - state["context_start_time"]
-        state["activity_time"][state["last_context"]] = (
-            state["activity_time"].get(state["last_context"], 0) + duration
+        activity_time = state.setdefault("activity_time", {})
+        activity_time[state["last_context"]] = (
+            activity_time.get(state["last_context"], 0) + duration
         )
         ctx_obj = state.get("previous_context_obj") or state.get("current_context")
         if ctx_obj and state.get("history") is not None:
@@ -271,6 +274,18 @@ def initialize_system(desktop_io=None, allow_actions=True, low_risk_approver=Non
 
 # ---------------- MAIN ----------------
 def main():
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print("BLINDSPOT — Context-Aware Desktop Perception & Autonomous Assistant\n")
+        print("Usage: python main.py [OPTIONS]\n")
+        print("Options:")
+        print("  (default)          Launch the Tkinter desktop UI (primary interface)")
+        print("  --ui               Explicitly launch the desktop UI (default behavior)")
+        print("  --cli, --no-ui     Launch in terminal CLI command loop mode")
+        print("  --mock-io          Use deterministic MockDesktopIO backend instead of real Windows I/O")
+        print("  --api, --dashboard Start FastAPI service (port 8000) in background for web dashboard")
+        print("  -h, --help         Show this help message and exit")
+        return
+
     # CLI approval: prompt the user for LOW_RISK_ACTION approval at runtime
     def _cli_approver(request: ActionRequest) -> bool:
         try:
@@ -285,8 +300,10 @@ def main():
         except (EOFError, KeyboardInterrupt):
             return False
 
-    is_ui_mode = "--ui" in sys.argv
+    is_cli_mode = "--cli" in sys.argv or "--no-ui" in sys.argv
+    is_ui_mode = not is_cli_mode
     use_mock_io = "--mock-io" in sys.argv
+
     components = initialize_system(
         low_risk_approver=None if is_ui_mode else _cli_approver,
         mock_io=use_mock_io,
@@ -311,8 +328,8 @@ def main():
         start_api_server_background(host="127.0.0.1", port=8000)
         print("[API] BLINDSPOT Dashboard API running on http://127.0.0.1:8000")
 
-    # Check for --ui flag to start desktop UI
-    if "--ui" in sys.argv:
+    # Launch desktop UI by default (primary product interface)
+    if is_ui_mode:
         from ui import run_ui
         try:
             run_ui(
@@ -322,11 +339,22 @@ def main():
                 tool_registry=tool_registry,
                 task_executor=task_executor,
                 desktop_io=desktop_io,
+                analyzer=analyzer,
             )
         finally:
             stop_event.set()
+            if "--api" in sys.argv or "--dashboard" in sys.argv:
+                try:
+                    from api import stop_api_server
+                    stop_api_server()
+                except Exception:
+                    pass
+            now = time.time()
+            with state_lock:
+                close_active_context(state, now)
         return
 
+    # CLI mode (secondary interface when --cli or --no-ui is specified)
     backend_label = get_backend_label(desktop_io)
     print(f"BLINDSPOT — quiet vision + OCR online [{backend_label}]\n")
 

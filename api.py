@@ -708,6 +708,13 @@ def start_api_server_background(host="127.0.0.1", port=8000):
     _server_thread.start()
 
 
+def stop_api_server():
+    """Stop the background API server if running."""
+    global _server_instance
+    if _server_instance is not None:
+        _server_instance.should_exit = True
+
+
 if __name__ == "__main__":
     import uvicorn
     # Standalone execution: ensures engine is initialized and running

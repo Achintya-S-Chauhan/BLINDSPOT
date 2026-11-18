@@ -96,10 +96,11 @@ class TestCliBackendSelection(unittest.TestCase):
     """Tests for CLI argument parsing for backend selection in main.py and ui.py."""
 
     @patch("main.initialize_system")
+    @patch("ui.run_ui")
     @patch("main.monitor")
     @patch("threading.Thread")
-    def test_main_cli_default_uses_windows_backend(self, mock_thread, mock_monitor, mock_init):
-        """09. python main.py defaults to mock_io=False."""
+    def test_main_cli_default_uses_windows_backend(self, mock_thread, mock_monitor, mock_run_ui, mock_init):
+        """09. python main.py defaults to desktop UI with mock_io=False."""
         from main import main as main_entry
 
         mock_init.return_value = {
@@ -114,21 +115,20 @@ class TestCliBackendSelection(unittest.TestCase):
             "desktop_io": WindowsDesktopIO(),
         }
 
-        with patch("sys.argv", ["main.py"]), patch("builtins.input", side_effect=EOFError):
-            try:
-                main_entry()
-            except (EOFError, StopIteration):
-                pass
+        with patch("sys.argv", ["main.py"]):
+            main_entry()
 
         mock_init.assert_called_once()
         _, kwargs = mock_init.call_args
         self.assertFalse(kwargs.get("mock_io"))
+        mock_run_ui.assert_called_once()
 
     @patch("main.initialize_system")
+    @patch("ui.run_ui")
     @patch("main.monitor")
     @patch("threading.Thread")
-    def test_main_cli_mock_io_flag(self, mock_thread, mock_monitor, mock_init):
-        """10. python main.py --mock-io passes mock_io=True."""
+    def test_main_cli_mock_io_flag(self, mock_thread, mock_monitor, mock_run_ui, mock_init):
+        """10. python main.py --mock-io passes mock_io=True and launches desktop UI."""
         from main import main as main_entry
 
         mock_init.return_value = {
@@ -143,7 +143,35 @@ class TestCliBackendSelection(unittest.TestCase):
             "desktop_io": MockDesktopIO(),
         }
 
-        with patch("sys.argv", ["main.py", "--mock-io"]), patch("builtins.input", side_effect=EOFError):
+        with patch("sys.argv", ["main.py", "--mock-io"]):
+            main_entry()
+
+        mock_init.assert_called_once()
+        _, kwargs = mock_init.call_args
+        self.assertTrue(kwargs.get("mock_io"))
+        mock_run_ui.assert_called_once()
+
+    @patch("main.initialize_system")
+    @patch("ui.run_ui")
+    @patch("main.monitor")
+    @patch("threading.Thread")
+    def test_main_cli_explicit_flag(self, mock_thread, mock_monitor, mock_run_ui, mock_init):
+        """10b. python main.py --cli enters terminal CLI mode without launching UI."""
+        from main import main as main_entry
+
+        mock_init.return_value = {
+            "state": {"last_context": None, "context_start_time": None, "activity_time": {}},
+            "state_lock": MagicMock(),
+            "analyzer": MagicMock(),
+            "assistant": MagicMock(),
+            "companion_ai": MagicMock(),
+            "tool_registry": MagicMock(),
+            "task_executor": MagicMock(),
+            "stop_event": MagicMock(),
+            "desktop_io": MockDesktopIO(),
+        }
+
+        with patch("sys.argv", ["main.py", "--cli"]), patch("builtins.input", side_effect=EOFError):
             try:
                 main_entry()
             except (EOFError, StopIteration):
@@ -151,7 +179,8 @@ class TestCliBackendSelection(unittest.TestCase):
 
         mock_init.assert_called_once()
         _, kwargs = mock_init.call_args
-        self.assertTrue(kwargs.get("mock_io"))
+        self.assertIsNotNone(kwargs.get("low_risk_approver"))
+        mock_run_ui.assert_not_called()
 
     @patch("main.initialize_system")
     @patch("ui.run_ui")

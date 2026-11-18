@@ -1,5 +1,10 @@
 # BLINDSPOT — Activity Intelligence & Live Desktop Dashboard
 
+[![Live Dashboard](https://img.shields.io/badge/Vercel-Live%20Dashboard-000000?style=for-the-badge&logo=vercel&logoColor=white)](https://blindspot-dashboard-six.vercel.app)
+[![FastAPI Backend](https://img.shields.io/badge/FastAPI-127.0.0.1%3A8000-009688?style=for-the-badge&logo=fastapi&logoColor=white)](http://127.0.0.1:8000)
+
+> 🚀 **Live Production Deployment:** [https://blindspot-dashboard-six.vercel.app](https://blindspot-dashboard-six.vercel.app)
+
 A context-aware desktop productivity and telemetry system integrating BLINDSPOT's real Python perception engine (Win32 foreground window hooks, in-memory Tesseract OCR, `DesktopContext`, and `ContextHistory`) with a modern React web dashboard and FastAPI REST backend.
 
 ---
@@ -60,13 +65,19 @@ python main.py --api
 
 ### Step 2: Start the React Dashboard
 
+#### Option A: Use Live Hosted Deployment (No local build needed)
+Access the production dashboard directly in your browser:
+**[https://blindspot-dashboard-six.vercel.app](https://blindspot-dashboard-six.vercel.app)**
+*Features automatic Demo Mode when disconnected from local engine, or live telemetry when local API (`http://127.0.0.1:8000`) is running.*
+
+#### Option B: Run Locally
 In a separate terminal:
 ```bash
 cd blindspot-dashboard
 npm install
 npm run dev
 ```
-*Dashboard will run at `http://localhost:5173`.*
+*Dashboard will run locally at `http://localhost:5173`.*
 
 ---
 
